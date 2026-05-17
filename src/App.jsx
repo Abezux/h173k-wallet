@@ -326,41 +326,43 @@ function WalletApp({ connection, onRpcChange }) {
   const fetchBalances = useCallback(async () => {
     if (!connection || !publicKey) return
     try {
-      const tokenAccount = await getAssociatedTokenAddress(TOKEN_MINT, publicKey)
+      // Fetch token balance
       try {
-        const account = await getAccount(connection, tokenAccount)
-        const newBalance = Number(account.amount) / Math.pow(10, TOKEN_DECIMALS)
-        setBalance(newBalance)
-        localStorage.setItem('h173k_cached_balance', newBalance.toString())
-        setRpcError(null) // Clear error on success
-      } catch (tokenErr) {
-        // Check for 401 Unauthorized error
-        if (tokenErr.message && (tokenErr.message.includes('401') || tokenErr.message.includes('Unauthorized'))) {
-          setRpcError('rpc_limit')
-          return
+        const tokenAccount = await getAssociatedTokenAddress(TOKEN_MINT, publicKey)
+        try {
+          const account = await getAccount(connection, tokenAccount)
+          const newBalance = Number(account.amount) / Math.pow(10, TOKEN_DECIMALS)
+          setBalance(newBalance)
+          localStorage.setItem('h173k_cached_balance', newBalance.toString())
+          setRpcError(null)
+        } catch (tokenErr) {
+          if (tokenErr.message && (tokenErr.message.includes('401') || tokenErr.message.includes('Unauthorized'))) {
+            setRpcError('rpc_limit')
+            // Don't return — still attempt SOL balance fetch below
+          } else if (tokenErr.name === 'TokenAccountNotFoundError' || tokenErr.name === 'TokenInvalidAccountOwnerError') {
+            setBalance(0)
+            localStorage.setItem('h173k_cached_balance', '0')
+            setRpcError(null)
+          }
+          // On network errors - keep previous balance
         }
-        // Only set to 0 if account doesn't exist, not on network errors
-        if (tokenErr.name === 'TokenAccountNotFoundError' || tokenErr.name === 'TokenInvalidAccountOwnerError') {
-          setBalance(0)
-          localStorage.setItem('h173k_cached_balance', '0')
-          setRpcError(null) // Clear error on success
-        }
-        // On network errors - keep previous balance
+      } catch {
+        // getAssociatedTokenAddress failure - keep previous token balance
       }
+
+      // Always fetch SOL balance independently
       const lamports = await connection.getBalance(publicKey)
       const newSolBalance = lamports / LAMPORTS_PER_SOL
       setSolBalance(newSolBalance)
       localStorage.setItem('h173k_cached_sol_balance', newSolBalance.toString())
-      setRpcError(null) // Clear error on success
+      if (!rpcError) setRpcError(null)
     } catch (err) {
-      // Check for 401 Unauthorized error
       if (err.message && (err.message.includes('401') || err.message.includes('Unauthorized'))) {
         setRpcError('rpc_limit')
       }
-      // Network error - keep previous balances, just log
       console.error('Balance fetch error:', err)
     }
-  }, [connection, publicKey])
+  }, [connection, publicKey, rpcError])
   
   useEffect(() => {
     if (isUnlocked && publicKey) {
@@ -1426,7 +1428,7 @@ function SendView({ connection, publicKey, balance, solBalance, price, toUSD, on
           {referrer && referralBonusInfo && referralBonusInfo.tokenAmount && (
             <div className="confirm-row referral-row">
               <span className="confirm-label">Referral Bonus</span>
-              <span className="confirm-value referral-value">+{formatSmartNumber(referralBonusInfo.tokenAmount)} h173k <span className="confirm-usd">(${referralBonusInfo.usdAmount})</span></span>
+              <span className="confirm-value referral-value">+{formatH173K(referralBonusInfo.tokenAmount)} h173k <span className="confirm-usd">(${referralBonusInfo.usdAmount})</span></span>
             </div>
           )}
           <div className="confirm-row"><span className="confirm-label">Network Fee</span><span className="confirm-value">~0.000005 SOL</span></div>
@@ -1436,7 +1438,7 @@ function SendView({ connection, publicKey, balance, solBalance, price, toUSD, on
           {referrer && referralBonusInfo && referralBonusInfo.tokenAmount && (
             <div className="confirm-row total-row">
               <span className="confirm-label">Total</span>
-              <span className="confirm-value">{formatSmartNumber(parseFloat(amount) + referralBonusInfo.tokenAmount)} h173k</span>
+              <span className="confirm-value">{formatH173K(parseFloat(amount) + referralBonusInfo.tokenAmount)} h173k</span>
             </div>
           )}
           <button className="btn btn-primary btn-action" onClick={handleSend} disabled={loading || swapLoading}>{loading ? (swapLoading ? 'Swapping SOL...' : 'Sending...') : 'Confirm & Send'}</button>
