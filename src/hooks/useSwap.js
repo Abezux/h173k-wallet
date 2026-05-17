@@ -10,7 +10,8 @@ import {
   Transaction, 
   TransactionInstruction,
   LAMPORTS_PER_SOL,
-  SystemProgram
+  SystemProgram,
+  ComputeBudgetProgram
 } from '@solana/web3.js'
 import { 
   TOKEN_PROGRAM_ID, 
@@ -20,7 +21,7 @@ import {
   createCloseAccountInstruction,
   getAccount
 } from '@solana/spl-token'
-import { TOKEN_MINT, TOKEN_DECIMALS } from '../constants'
+import { TOKEN_MINT, TOKEN_DECIMALS, getReplenishSettings } from '../constants'
 
 // H173K-SOL Pool ID (CPMM type)
 const POOL_ID = new PublicKey('8A7r3ZT7nXjtghKKnmVhrwnApJHG4tpvBF9BDCBmHWqr')
@@ -43,8 +44,9 @@ const POOL_CONFIG = {
   observationKey: new PublicKey('DbajbtNyRaTSgvKQHJA3paU1B83aWFqmKLwoQLkSpciJ')  // offset 296-327
 }
 
-// Minimum SOL required to execute a swap transaction
-const MIN_SOL_FOR_SWAP = 0.003
+// Minimum SOL required to execute a swap transaction.
+// Real cost: WSOL ATA creation (0.00204) + priority fee + base fee.
+const MIN_SOL_FOR_SWAP = 0.00204 + 0.000005 // ~0.002045
 
 // SOL buffer added when replenishing
 const SOL_BUFFER = 0.007
@@ -336,6 +338,16 @@ export function useSwap(connection, wallet) {
         needsWSOLClose = true
       }
       
+      // Add priority fee (compute budget) from settings
+      const { swapFeeSol } = getReplenishSettings()
+      const SWAP_COMPUTE_UNITS = 250_000
+      if (swapFeeSol > 0) {
+        const priorityFeeLamports = Math.round(swapFeeSol * LAMPORTS_PER_SOL)
+        const microLamportsPerCU = Math.ceil((priorityFeeLamports * 1_000_000) / SWAP_COMPUTE_UNITS)
+        transaction.add(ComputeBudgetProgram.setComputeUnitLimit({ units: SWAP_COMPUTE_UNITS }))
+        transaction.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: microLamportsPerCU }))
+      }
+
       // Create WSOL account if needed
       if (needsWSOLCreate) {
         transaction.add(
@@ -572,11 +584,15 @@ export function useSwap(connection, wallet) {
     
     console.log(`💰 Current SOL balance: ${currentSOL.toFixed(6)} SOL`)
     
-    // Need at least some SOL to pay for swap transaction fees
-    const MIN_SOL_FOR_SWAP_TX = 0.003
+    // swapFeeSol is the inviolable minimum – swap is exempt from this floor (it acquires more SOL)
+    // but we need at least swapFeeSol + base fee to pay for this very transaction
+    const { swapFeeSol: swapFeeFloor } = getReplenishSettings()
+    // ✅ useSwap.js ~591
+    const WSOL_ATA_RENT = 0.00204
+    const MIN_SOL_FOR_SWAP_TX = swapFeeFloor + 0.000005 + WSOL_ATA_RENT  // = 0.002145 SOL
     
     if (currentSOL < MIN_SOL_FOR_SWAP_TX) {
-      throw new Error(`NO_SOL:Not enough SOL to execute swap. Have ${currentSOL.toFixed(6)} SOL, need at least ${MIN_SOL_FOR_SWAP_TX} SOL. Please deposit SOL first.`)
+      throw new Error(`NO_SOL:Not enough SOL to execute swap. Have ${currentSOL.toFixed(6)} SOL, need at least ${MIN_SOL_FOR_SWAP_TX.toFixed(6)} SOL. Please deposit a small amount of SOL first.`)
     }
     
     // Calculate how much H173K we need to swap
@@ -615,80 +631,144 @@ export function useSwap(connection, wallet) {
    * @param {Function} onSwap - Optional callback when swap occurs (for UI feedback)
    * @returns {any} - Result of the operation
    */
-  const withAutoSOL = useCallback(async (operation, onSwap) => {
+  const withAutoSOL = useCallback(async (operation, onSwap, extraSOLNeeded = 0) => {
     if (!wallet?.publicKey) {
       throw new Error('Wallet not connected')
     }
-    
+
+    const settings = getReplenishSettings()
+
+    // === REPLENISH TARGET ===
+    // Minimum SOL needed to pay for the replenish swap transaction itself.
+    // Guard: wallet must have at least this much to initiate a swap at all.
+    const swapTxCost = settings.swapFeeSol + 0.000005
+
+    // Target = what the user configured + one swapTxCost buffer + any extra SOL
+    // the caller knows will be consumed by the operation (e.g. sponsor transfer).
+    // This ensures the wallet has enough AFTER the operation completes.
+    const TARGET = settings.replenishTo + swapTxCost + extraSOLNeeded
+
+    // === PROACTIVE CHECK ===
+    // Top up before the operation if SOL is below the user-defined threshold.
+    // Guard: need at least swapTxCost to pay for the replenish swap itself.
+    try {
+      const currentLamports = await connection.getBalance(wallet.publicKey)
+      const currentSOL = currentLamports / LAMPORTS_PER_SOL
+
+      // Replenish proactively if:
+      //   a) below user-configured threshold, OR
+      //   b) current SOL won't cover the operation's extra cost (e.g. account creation rent)
+      //      — even if above the threshold, we need enough for swapTxCost + extraSOLNeeded.
+      // Floor guard: must have at least swapTxCost to pay for the replenish swap itself.
+      const WSOL_ATA_RENT = 0.00204
+      const actualSwapFloor = WSOL_ATA_RENT + swapTxCost  // 0.002145 — min do kolejnego swapa
+
+      const needsReplenish =
+      (
+        currentSOL < settings.threshold ||
+        (extraSOLNeeded > 0 && currentSOL < totalNeeded) ||
+        (currentSOL - extraSOLNeeded < settings.replenishTo + actualSwapFloor)  // ← NOWY WARUNEK
+      ) &&
+      currentSOL >= swapTxCost
+
+      if (needsReplenish) {
+        // How much to buy: enough to reach TARGET from current balance,
+        // PLUS the cost of the swap tx itself (swapFeeSol + base fee).
+        // Without this, the tx fee eats into the received SOL and we land below TARGET.
+        const neededSOL = TARGET - currentSOL + swapTxCost
+        if (neededSOL > 0) {
+          console.log(`⚡ Proactive replenish: ${currentSOL.toFixed(6)} SOL → target ${TARGET.toFixed(6)} SOL (replenishTo=${settings.replenishTo}, +swapBuffer=${swapTxCost.toFixed(6)})`)
+          if (onSwap) onSwap({ status: 'swapping', attempt: 0 })
+          try {
+            setLoading(true)
+            const swapResult = await swapForSOL(neededSOL)
+            setLoading(false)
+            if (onSwap) onSwap({ status: 'swapped', h173kUsed: swapResult.h173kUsed, solReceived: swapResult.solReceived })
+            await new Promise(r => setTimeout(r, 1500))
+
+            // === POST-SWAP SLIPPAGE CHECK ===
+            // Verify the swap actually reached TARGET (slippage may have fallen short).
+            // If still below TARGET and wallet has enough to pay for another swap, top up the remainder.
+            try {
+              const afterLamports = await connection.getBalance(wallet.publicKey)
+              const afterSOL = afterLamports / LAMPORTS_PER_SOL
+              const stillNeeded = TARGET - afterSOL
+              if (stillNeeded > 0 && afterSOL >= swapTxCost) {
+                console.log(`⚡ Slippage top-up: ${afterSOL.toFixed(6)} SOL still short of target by ${stillNeeded.toFixed(6)} SOL, buying remainder`)
+                if (onSwap) onSwap({ status: 'swapping', attempt: 0 })
+                setLoading(true)
+                const topUpResult = await swapForSOL(stillNeeded)
+                setLoading(false)
+                if (onSwap) onSwap({ status: 'swapped', h173kUsed: topUpResult.h173kUsed, solReceived: topUpResult.solReceived })
+                await new Promise(r => setTimeout(r, 1500))
+              }
+            } catch (topUpErr) {
+              setLoading(false)
+              if (topUpErr?.message?.startsWith('NO_H173K:')) throw new Error(topUpErr.message.replace('NO_H173K:', ''))
+              if (topUpErr?.message?.startsWith('NO_SOL:')) throw new Error(topUpErr.message.replace('NO_SOL:', ''))
+              console.log('Warning: Slippage top-up failed, continuing:', topUpErr?.message)
+            }
+          } catch (swapErr) {
+            setLoading(false)
+            if (swapErr?.message?.startsWith('NO_H173K:')) throw new Error(swapErr.message.replace('NO_H173K:', ''))
+            if (swapErr?.message?.startsWith('NO_SOL:')) throw new Error(swapErr.message.replace('NO_SOL:', ''))
+            console.log('Warning: Proactive swap failed, continuing:', swapErr?.message)
+          }
+        }
+      }
+    } catch (err) {
+      if (err.message && (err.message.includes('NO_H173K') || err.message.includes('NO_SOL'))) throw err
+    }
+
     const MAX_RETRIES = 2
     let lastError = null
-    
+
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       console.log(`🚀 withAutoSOL: Attempt ${attempt + 1}/${MAX_RETRIES + 1}...`)
-      
+
       try {
-        // Try the operation
         return await operation()
       } catch (error) {
         lastError = error
         console.log(`❌ Attempt ${attempt + 1} failed:`, error?.message || error)
-        
-        // If this was the last retry, don't try to swap again
+
         if (attempt >= MAX_RETRIES) {
           console.log('❌ Max retries reached, giving up')
           break
         }
-        
-        // Try to get more SOL
-        const solToGet = SOL_BUFFER * (attempt + 1) // Increase each retry: 0.007, 0.014
-        console.log(`💡 Will try to swap for ${solToGet.toFixed(4)} SOL and retry...`)
-        
+
+        // Reactive: re-fetch real-time balance and calculate exactly what's needed to reach TARGET
+        let solToGet = TARGET
         try {
-          // Notify UI about swap
-          if (onSwap) {
-            onSwap({ status: 'swapping', attempt: attempt + 1 })
-          }
-          
+          const lamports = await connection.getBalance(wallet.publicKey)
+          const currentSOL = lamports / LAMPORTS_PER_SOL
+          // Buy what's missing to reach TARGET plus the swap tx cost itself;
+          // always at least swapTxCost so the swap can execute.
+          solToGet = Math.max(TARGET - currentSOL + swapTxCost, swapTxCost + 0.000005)
+        } catch { /* use TARGET as fallback */ }
+
+        console.log(`💡 Reactive replenish: getting ${solToGet.toFixed(6)} SOL (target=${TARGET.toFixed(6)}, replenishTo=${settings.replenishTo})`)
+
+        try {
+          if (onSwap) onSwap({ status: 'swapping', attempt: attempt + 1 })
           setLoading(true)
           const swapResult = await swapForSOL(solToGet)
           setLoading(false)
-          
-          // Notify UI about swap completion
-          if (onSwap) {
-            onSwap({ 
-              status: 'swapped', 
-              h173kUsed: swapResult.h173kUsed, 
-              solReceived: swapResult.solReceived 
-            })
-          }
-          
-          // Wait a moment for balance to update
+          if (onSwap) onSwap({ status: 'swapped', h173kUsed: swapResult.h173kUsed, solReceived: swapResult.solReceived })
           await new Promise(r => setTimeout(r, 1500))
-          
           console.log('🔄 Retrying operation...')
-          // Continue to next iteration to retry
-          
         } catch (swapError) {
           setLoading(false)
           console.log('❌ Swap failed:', swapError?.message)
-          
-          // Check if it's because no H173K or no SOL
-          if (swapError?.message?.startsWith('NO_H173K:')) {
-            throw new Error(swapError.message.replace('NO_H173K:', ''))
-          }
-          if (swapError?.message?.startsWith('NO_SOL:')) {
-            throw new Error(swapError.message.replace('NO_SOL:', ''))
-          }
-          
-          // Swap failed for other reason, throw original error
+          if (swapError?.message?.startsWith('NO_H173K:')) throw new Error(swapError.message.replace('NO_H173K:', ''))
+          if (swapError?.message?.startsWith('NO_SOL:')) throw new Error(swapError.message.replace('NO_SOL:', ''))
           throw lastError
         }
       }
     }
-    
-    // All retries exhausted
+
     throw lastError
-  }, [wallet, swapForSOL])
+  }, [wallet, swapForSOL, connection])
   
   return {
     loading,
@@ -698,6 +778,7 @@ export function useSwap(connection, wallet) {
     getSwapQuoteSOLtoH173K,
     executeSwap,
     calculateSwapForSOL,
+    swapForSOL,
     withAutoSOL,
     convertSOLtoH173K,
     fetchPoolData,

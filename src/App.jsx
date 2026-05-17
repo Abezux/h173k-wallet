@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { Connection, PublicKey, Transaction, LAMPORTS_PER_SOL } from '@solana/web3.js'
+import { Connection, PublicKey, Transaction, LAMPORTS_PER_SOL, SystemProgram } from '@solana/web3.js'
 import { 
   TOKEN_PROGRAM_ID, 
   ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -46,11 +46,12 @@ import { useSwap } from './hooks/useSwap'
 import { useEscrowProgram } from './hooks/useEscrow'
 
 // Constants & Utils
-import { TOKEN_MINT, TOKEN_DECIMALS, getRpcEndpoint, saveRpcEndpoint, isRpcConfigured, validateRpcEndpoint, DEFAULT_RPC_ENDPOINT, OfferStatus } from './constants'
+import { TOKEN_MINT, TOKEN_DECIMALS, getRpcEndpoint, saveRpcEndpoint, isRpcConfigured, validateRpcEndpoint, DEFAULT_RPC_ENDPOINT, OfferStatus, getReplenishSettings, saveReplenishSettings, DEFAULT_REPLENISH_SETTINGS, getSponsorAccounts, saveSponsorAccounts, WSOL_ATA_RENT as WSOL_ATA_RENT_CONST, MIN_SWAP_PRIORITY_FEE, MIN_TRIGGER_THRESHOLD, MIN_REPLENISH_TO, getH173KDecimals, saveH173KDecimals } from './constants'
 import { useTokenPrice } from './usePrice'
 import { 
   formatNumber, 
   formatSmartNumber,
+  formatH173K,
   formatUSD, 
   shortenAddress, 
   copyToClipboard,
@@ -61,7 +62,9 @@ import {
   canCancelOffer,
   canReleaseOffer,
   canBurnOffer,
-  hasAlreadyConfirmed
+  hasAlreadyConfirmed,
+  getSellerIndexPDA,
+  getBuyerIndexPDA
 } from './utils'
 
 import './App.css'
@@ -282,6 +285,7 @@ function WalletApp({ connection, onRpcChange }) {
   })
   const [currentView, setCurrentView] = useState('main')
   const [toast, setToast] = useState(null)
+  const [h173kDecimals, setH173kDecimals] = useState(() => getH173KDecimals())
   
   // Check for referral code in URL on mount
   const [pendingReferral, setPendingReferral] = useState(() => getReferralFromURL())
@@ -405,6 +409,7 @@ function WalletApp({ connection, onRpcChange }) {
           onRefresh={fetchBalances} onLock={handleLock}
           showToast={showToast}
           rpcError={rpcError}
+          h173kDecimals={h173kDecimals}
         />
       )}
       
@@ -421,7 +426,7 @@ function WalletApp({ connection, onRpcChange }) {
       )}
       
       {currentView === 'history' && (
-        <HistoryView connection={connection} publicKey={publicKey} onBack={() => setCurrentView('main')} />
+        <HistoryView connection={connection} publicKey={publicKey} onBack={() => setCurrentView('main')} h173kDecimals={h173kDecimals} />
       )}
       
       {currentView === 'escrow' && (
@@ -429,12 +434,14 @@ function WalletApp({ connection, onRpcChange }) {
           connection={connection} publicKey={publicKey} balance={balance}
           solBalance={solBalance} price={price} toUSD={toUSD}
           onBack={() => setCurrentView('main')} showToast={showToast} onRefresh={fetchBalances}
+          h173kDecimals={h173kDecimals}
         />
       )}
       
       {currentView === 'settings' && (
         <SettingsView
-          publicKey={publicKey} onBack={() => setCurrentView('main')} showToast={showToast}
+          connection={connection} publicKey={publicKey} solBalance={solBalance}
+          onBack={() => setCurrentView('main')} showToast={showToast}
           onDeleteWallet={() => { 
             deleteWallet(); 
             clearReferrer(); // Clear referral data when wallet is deleted
@@ -447,6 +454,7 @@ function WalletApp({ connection, onRpcChange }) {
             setSolBalance(0);
           }}
           onRpcChange={onRpcChange}
+          onDecimalsChange={setH173kDecimals}
         />
       )}
       
@@ -779,7 +787,7 @@ function LockScreen({ onUnlock, showToast }) {
 }
 
 // ========== MAIN VIEW ==========
-function MainView({ connection, publicKey, balance, solBalance, price, toUSD, onSend, onReceive, onHistory, onEscrow, onSettings, onRefresh, onLock, showToast, rpcError }) {
+function MainView({ connection, publicKey, balance, solBalance, price, toUSD, onSend, onReceive, onHistory, onEscrow, onSettings, onRefresh, onLock, showToast, rpcError, h173kDecimals }) {
   const [refreshing, setRefreshing] = useState(false)
   const [showSolPrompt, setShowSolPrompt] = useState(false)
   const [solPromptDismissed, setSolPromptDismissed] = useState(false)
@@ -787,6 +795,7 @@ function MainView({ connection, publicKey, balance, solBalance, price, toUSD, on
   const [showConvertModal, setShowConvertModal] = useState(false)
   const [convertAmount, setConvertAmount] = useState('')
   const [convertQuote, setConvertQuote] = useState(null)
+
   const usdValue = toUSD ? toUSD(balance) : null
   
   const { 
@@ -806,15 +815,17 @@ function MainView({ connection, publicKey, balance, solBalance, price, toUSD, on
   
   // Determine if SOL warning should be shown
   // Only show if not enough SOL for swap even with h173k
-  const needsDeposit = solBalance < MIN_SOL_FOR_SWAP
-  const lowSOL = solBalance < MIN_SOL_BALANCE && solBalance >= MIN_SOL_FOR_SWAP
+  const { swapFeeSol: _swapFeeSol, threshold: solThreshold, replenishTo: solReplenishTo } = getReplenishSettings()
+  const swapTxFloor = _swapFeeSol + 0.000005  // absolute minimum to initiate any swap
+  const needsDeposit = solBalance < swapTxFloor
+  const lowSOL = solBalance < MIN_SOL_BALANCE && solBalance >= swapTxFloor
   
   // Show SOL prompt if SOL is very low (can't even do a swap) and not dismissed
   useEffect(() => {
-    if (solBalance >= MIN_SOL_FOR_SWAP) {
+    if (solBalance >= swapTxFloor) {
       // Have enough SOL for swaps - close prompt
       setShowSolPrompt(false)
-    } else if (solBalance < MIN_SOL_FOR_SWAP && !solPromptDismissed) {
+    } else if (solBalance < swapTxFloor && !solPromptDismissed) {
       setShowSolPrompt(true)
     }
   }, [solBalance, solPromptDismissed])
@@ -847,7 +858,7 @@ function MainView({ connection, publicKey, balance, solBalance, price, toUSD, on
     
     setEmergencySwapping(true)
     try {
-      const targetSOL = 0.003
+      const targetSOL = solReplenishTo  // use user-configured replenish target
       const { h173kNeeded, quote } = await calculateSwapForSOL(targetSOL)
       
       if (h173kNeeded > balance) {
@@ -866,7 +877,17 @@ function MainView({ connection, publicKey, balance, solBalance, price, toUSD, on
   }
   
   // SOL to h173k conversion
-  const maxConvertableSOL = Math.max(0, solBalance - 0.02) // Keep minimum 0.02 SOL
+  const { convertThreshold, replenishTo, swapFeeSol, threshold } = getReplenishSettings()
+  const WSOL_ATA_RENT = 0.00204 // 2039280 lamports — rent-exempt deposit for a token account
+  // Solana system accounts must stay above rent-exempt minimum (890880 lamports ≈ 0.00089 SOL).
+  const SOL_ACCOUNT_RENT_EXEMPT = 0.00089088
+  const effectiveThreshold = Math.max(threshold, SOL_ACCOUNT_RENT_EXEMPT)
+  // Cost of this conversion (WSOL ATA is always closed after swap, so rent is always needed).
+  const CONVERT_ATA_OVERHEAD = WSOL_ATA_RENT + swapFeeSol + 0.000005
+  // Reserve enough SOL for the *next* swap (replenish: h173k→SOL) so it's always executable.
+  // That swap creates a fresh WSOL ATA for output: full rent + fees required.
+  const NEXT_SWAP_RESERVE = WSOL_ATA_RENT + swapFeeSol + 0.000005
+  const maxConvertableSOL = Math.floor(Math.max(0, solBalance - effectiveThreshold - CONVERT_ATA_OVERHEAD - NEXT_SWAP_RESERVE) * 10000) / 10000
   
   const handleConvertAmountChange = async (value) => {
     setConvertAmount(value)
@@ -882,6 +903,9 @@ function MainView({ connection, publicKey, balance, solBalance, price, toUSD, on
       }
     }
   }
+
+  const convertAmountNum = parseFloat(convertAmount)
+  const convertAmountOverLimit = convertAmountNum > 0 && convertAmountNum > maxConvertableSOL
   
   const handleConvert = async () => {
     const numAmount = parseFloat(convertAmount)
@@ -939,50 +963,88 @@ function MainView({ connection, publicKey, balance, solBalance, price, toUSD, on
   
   // SOL Deposit Prompt Modal - only show when can't even do swaps
   if (showSolPrompt) {
+    const { swapFeeSol: _swapFeeFloor } = getReplenishSettings()
+    // If we have enough SOL for the priority fee but no h173k to auto-replenish → h173k problem, not SOL
+    const isH173KProblem = solBalance >= _swapFeeFloor && balance === 0
+
     return (
       <div className="main-view">
         <div className="sol-prompt-overlay">
           <div className="sol-prompt-card">
-            <div className="sol-prompt-icon">⚡</div>
-            <h2>Deposit SOL to Get Started</h2>
-            <p>Your wallet needs a small amount of SOL to pay for transaction fees on Solana network.</p>
-            
-            <div className="sol-prompt-info">
-              <div className="sol-prompt-row">
-                <span>Recommended</span>
-                <span className="sol-amount">0.01 - 0.05 SOL</span>
-              </div>
-              <div className="sol-prompt-row">
-                <span>Approximate cost</span>
-                <span className="sol-amount">~$2 - $10</span>
-              </div>
-            </div>
-            
-            <div className="sol-prompt-address">
-              <div className="sol-prompt-label">Send SOL to this address:</div>
-              <QRCodeGenerator data={publicKey.toString()} size={180} />
-              <div className="address-display" onClick={() => copyToClipboard(publicKey.toString())}>
-                <span className="address-text">{publicKey.toString()}</span>
-                <span className="copy-icon"><CopyIcon /></span>
-              </div>
-            </div>
-            
-            <p className="sol-prompt-note">
-              💡 Once you have h173k tokens, the wallet can automatically swap small amounts to SOL when needed for fees.
-            </p>
+            {isH173KProblem ? (
+              <>
+                <div className="sol-prompt-icon">🪙</div>
+                <h2>Add h173k Tokens</h2>
+                <p>Your wallet has SOL for fees, but needs h173k tokens to enable automatic SOL replenishment.</p>
+
+                <div className="sol-prompt-info">
+                  <div className="sol-prompt-row">
+                    <span>Current SOL</span>
+                    <span className="sol-amount">{formatNumber(solBalance, 4)} SOL</span>
+                  </div>
+                  <div className="sol-prompt-row">
+                    <span>h173k balance</span>
+                    <span className="sol-amount">0 h173k</span>
+                  </div>
+                </div>
+
+                <div className="sol-prompt-address">
+                  <div className="sol-prompt-label">Receive h173k at this address:</div>
+                  <QRCodeGenerator data={publicKey.toString()} size={180} />
+                  <div className="address-display" onClick={() => copyToClipboard(publicKey.toString())}>
+                    <span className="address-text">{publicKey.toString()}</span>
+                    <span className="copy-icon"><CopyIcon /></span>
+                  </div>
+                </div>
+
+                <p className="sol-prompt-note">
+                  💡 Once you have h173k, the wallet will automatically swap small amounts to SOL whenever fees are needed.
+                </p>
+              </>
+            ) : (
+              <>
+                <div className="sol-prompt-icon">⚡</div>
+                <h2>Deposit SOL to Get Started</h2>
+                <p>Your wallet needs a small amount of SOL to pay for transaction fees on Solana network.</p>
+                
+                <div className="sol-prompt-info">
+                  <div className="sol-prompt-row">
+                    <span>Recommended</span>
+                    <span className="sol-amount">0.01 - 0.05 SOL</span>
+                  </div>
+                  <div className="sol-prompt-row">
+                    <span>Approximate cost</span>
+                    <span className="sol-amount">~$2 - $10</span>
+                  </div>
+                </div>
+                
+                <div className="sol-prompt-address">
+                  <div className="sol-prompt-label">Send SOL to this address:</div>
+                  <QRCodeGenerator data={publicKey.toString()} size={180} />
+                  <div className="address-display" onClick={() => copyToClipboard(publicKey.toString())}>
+                    <span className="address-text">{publicKey.toString()}</span>
+                    <span className="copy-icon"><CopyIcon /></span>
+                  </div>
+                </div>
+                
+                <p className="sol-prompt-note">
+                  💡 Once you have h173k tokens, the wallet can automatically swap small amounts to SOL when needed for fees.
+                </p>
+              </>
+            )}
             
             <div className="sol-prompt-actions">
               <button className="btn btn-primary btn-action" onClick={handleCheckDeposit} disabled={refreshing}>
-                {refreshing ? 'Checking...' : 'I\'ve Deposited SOL'}
+                {refreshing ? 'Checking...' : isH173KProblem ? 'I\'ve Added h173k' : 'I\'ve Deposited SOL'}
               </button>
-              {balance > 0 && (
+              {!isH173KProblem && balance > 0 && (
                 <button 
                   className="btn btn-action" 
                   onClick={handleEmergencySwap} 
                   disabled={emergencySwapping || swapLoading}
                   style={{ backgroundColor: '#f59e0b', borderColor: '#f59e0b' }}
                 >
-                  {emergencySwapping ? 'Swapping...' : 'Swap h173k for 0.003 SOL'}
+                  {emergencySwapping ? 'Swapping...' : `Swap h173k for ${solReplenishTo} SOL`}
                 </button>
               )}
               <button className="btn" onClick={handleDismissSolPrompt}>
@@ -1005,19 +1067,32 @@ function MainView({ connection, publicKey, balance, solBalance, price, toUSD, on
             <p>Convert your excess SOL to h173k tokens.</p>
             
             <div className="form-group">
-              <label className="form-label">Amount (SOL)</label>
+              <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+                <label className="form-label" style={{margin:0}}>Amount (SOL)</label>
+                <button
+                  className="btn"
+                  style={{fontSize:'0.7rem', padding:'2px 8px', height:'auto', marginBottom:'6px'}}
+                  onClick={() => handleConvertAmountChange(String(maxConvertableSOL))}
+                >MAX</button>
+              </div>
               <input 
                 type="number" 
-                className="form-input" 
+                className={`form-input${convertAmountOverLimit ? ' input-error' : ''}`}
                 placeholder="0.00" 
                 value={convertAmount} 
                 onChange={(e) => handleConvertAmountChange(e.target.value)}
                 step="0.01"
                 max={maxConvertableSOL}
               />
-              <div className="input-hint">
-                Available: {formatNumber(maxConvertableSOL, 4)} SOL (keeping 0.02 SOL for fees)
-              </div>
+              {convertAmountOverLimit
+                ? <div className="input-hint" style={{color:'var(--error, #e05)'}}>
+                    Exceeds max — enter {formatNumber(maxConvertableSOL, 4)} SOL or less
+                  </div>
+                : <div className="input-hint">
+                    Max: {formatNumber(maxConvertableSOL, 4)} SOL · Reserved: {formatNumber(effectiveThreshold + CONVERT_ATA_OVERHEAD + NEXT_SWAP_RESERVE, 4)} SOL
+
+                  </div>
+              }
             </div>
             
             {convertQuote && (
@@ -1038,7 +1113,7 @@ function MainView({ connection, publicKey, balance, solBalance, price, toUSD, on
               <button 
                 className="btn btn-primary btn-action" 
                 onClick={handleConvert} 
-                disabled={swapLoading || !convertQuote || parseFloat(convertAmount) <= 0}
+                disabled={swapLoading || !convertQuote || parseFloat(convertAmount) <= 0 || convertAmountOverLimit}
               >
                 {swapLoading ? 'Converting...' : 'Convert'}
               </button>
@@ -1093,11 +1168,11 @@ function MainView({ connection, publicKey, balance, solBalance, price, toUSD, on
       
       <div className="balance-card">
         <div className="balance-label">Balance</div>
-        <div className="balance-amount">{formatNumber(balance)} <span className="balance-symbol">h173k</span></div>
+        <div className="balance-amount">{formatH173K(balance, h173kDecimals)} <span className="balance-symbol">h173k</span></div>
         {usdValue !== null && <div className="balance-usd">{formatUSD(usdValue)}</div>}
         <div className="balance-sol-row">
           <span className="balance-sol">{formatNumber(solBalance, 4)} SOL</span>
-          {solBalance > 0.02 && (
+          {solBalance > convertThreshold  && (
             <button className="convert-sol-btn" onClick={() => setShowConvertModal(true)}>
               Convert
             </button>
@@ -1154,6 +1229,8 @@ function SendView({ connection, publicKey, balance, solBalance, price, toUSD, on
   const [showScanner, setShowScanner] = useState(false)
   const [confirmStep, setConfirmStep] = useState(false)
   const [txSignature, setTxSignature] = useState(null)
+  const [sponsorAmtState, setSponsorAmtState] = useState(0) // pre-calculated in validateAndProceed
+  const [extraSOLNeeded, setExtraSOLNeeded] = useState(0)   // sponsor + recipient ATA rent
   
   const { withAutoSOL, loading: swapLoading } = useSwap(connection, sessionWallet)
   const usdValue = toUSD && amount ? toUSD(parseFloat(amount) || 0) : null
@@ -1184,6 +1261,42 @@ function SendView({ connection, publicKey, balance, solBalance, price, toUSD, on
       showToast('Insufficient balance' + (referralBonusInfo ? ' (including referral bonus)' : ''), 'error')
       return 
     }
+
+    // Pre-calculate sponsor amount + recipient ATA cost.
+    // No sender cap here — withAutoSOL handles reserves via TARGET = replenishTo + swapTxCost + extraSOLNeeded.
+    // After replenish sender has TARGET SOL, spends extraSOLNeeded, keeps replenishTo + swapTxCost as reserve.
+    const WSOL_ATA_RENT_SP   = 0.00204
+    const SOL_RENT_EXEMPT_SP = 0.00089088
+    const TX_BASE_FEE_SP     = 0.000005
+    const { swapFeeSol: recipientSwapFee } = getReplenishSettings()
+    const SWAP_FEE_SP = recipientSwapFee || 0.0001
+
+    // Check if recipient token ATA needs creating — costs rent paid by sender
+    let recipientAtaRent = 0
+    try {
+      const recipientPubkeyCheck = new PublicKey(recipient)
+      const recipientTokenAccountCheck = await getAssociatedTokenAddress(TOKEN_MINT, recipientPubkeyCheck)
+      await getAccount(connection, recipientTokenAccountCheck)
+    } catch {
+      recipientAtaRent = WSOL_ATA_RENT_SP
+    }
+
+    let sponsorAmt = 0
+    if (getSponsorAccounts()) {
+      try {
+        const REQUIRED_SOL = SOL_RENT_EXEMPT_SP
+          + (WSOL_ATA_RENT_SP + SWAP_FEE_SP + TX_BASE_FEE_SP)
+          + (WSOL_ATA_RENT_SP + SWAP_FEE_SP + TX_BASE_FEE_SP)
+        const recipientPubkey = new PublicKey(recipient)
+        const recipientLamports = await connection.getBalance(recipientPubkey)
+        const recipientSOL = recipientLamports / LAMPORTS_PER_SOL
+        sponsorAmt = Math.max(0, REQUIRED_SOL - recipientSOL)
+      } catch { /* leave at 0 */ }
+    }
+    setSponsorAmtState(sponsorAmt)
+    // extraSOLNeeded = everything this send will spend on SOL:
+    // sponsor transfer to recipient + recipient token ATA creation rent
+    setExtraSOLNeeded(sponsorAmt + recipientAtaRent)
     
     setConfirmStep(true)
   }
@@ -1210,6 +1323,18 @@ function SendView({ connection, publicKey, balance, solBalance, price, toUSD, on
           // Main transfer
           transaction.add(createTransferInstruction(senderTokenAccount, recipientTokenAccount, publicKey, amountLamports))
           
+          // Sponsor transfer — amount pre-calculated and capped in validateAndProceed.
+          // withAutoSOL already replenished enough SOL to cover this.
+          if (getSponsorAccounts() && sponsorAmtState > 0) {
+            transaction.add(
+              SystemProgram.transfer({
+                fromPubkey: publicKey,
+                toPubkey: recipientPubkey,
+                lamports: Math.round(sponsorAmtState * LAMPORTS_PER_SOL)
+              })
+            )
+          }
+
           // Add referral bonus transfer if referrer exists and bonus is calculable
           if (referrer && referralBonusLamports && referralBonusLamports > 0) {
             try {
@@ -1248,7 +1373,8 @@ function SendView({ connection, publicKey, balance, solBalance, price, toUSD, on
             showToast(`Swapped ${formatSmartNumber(swapInfo.h173kUsed)} h173k for ${swapInfo.solReceived.toFixed(4)} SOL`, 'info')
             if (onRefresh) onRefresh()
           }
-        }
+        },
+        extraSOLNeeded  // sponsor transfer + recipient ATA rent — withAutoSOL factors this into replenish target
       )
       
       setTxSignature(signature)
@@ -1272,7 +1398,7 @@ function SendView({ connection, publicKey, balance, solBalance, price, toUSD, on
         <div className="success-card">
           <div className="success-icon">✓</div>
           <h2>Sent!</h2>
-          <p className="success-amount">{formatNumber(parseFloat(amount))} h173k</p>
+          <p className="success-amount">{formatH173K(parseFloat(amount))} h173k</p>
           <p className="success-to">to {shortenAddress(recipient)}</p>
           <a href={`https://solscan.io/tx/${txSignature}`} target="_blank" rel="noopener noreferrer" className="tx-link">View on Solscan →</a>
           <button className="btn btn-primary" onClick={onBack}>Done</button>
@@ -1295,7 +1421,7 @@ function SendView({ connection, publicKey, balance, solBalance, price, toUSD, on
       <div className="send-view">
         <div className="view-header"><button className="back-btn" onClick={() => setConfirmStep(false)}><BackIcon size={16} /> Back</button><h2>Confirm Send</h2></div>
         <div className="confirm-card">
-          <div className="confirm-row"><span className="confirm-label">Amount</span><span className="confirm-value">{formatNumber(parseFloat(amount))} h173k{usdValue && <span className="confirm-usd">({formatUSD(usdValue)})</span>}</span></div>
+          <div className="confirm-row"><span className="confirm-label">Amount</span><span className="confirm-value">{formatH173K(parseFloat(amount))} h173k{usdValue && <span className="confirm-usd">({formatUSD(usdValue)})</span>}</span></div>
           <div className="confirm-row"><span className="confirm-label">To</span><span className="confirm-value address">{shortenAddress(recipient)}</span></div>
           {referrer && referralBonusInfo && referralBonusInfo.tokenAmount && (
             <div className="confirm-row referral-row">
@@ -1304,6 +1430,9 @@ function SendView({ connection, publicKey, balance, solBalance, price, toUSD, on
             </div>
           )}
           <div className="confirm-row"><span className="confirm-label">Network Fee</span><span className="confirm-value">~0.000005 SOL</span></div>
+          {sponsorAmtState > 0 && (
+            <div className="confirm-row"><span className="confirm-label">Recipient top-up</span><span className="confirm-value">{formatNumber(sponsorAmtState, 6)} SOL</span></div>
+          )}
           {referrer && referralBonusInfo && referralBonusInfo.tokenAmount && (
             <div className="confirm-row total-row">
               <span className="confirm-label">Total</span>
@@ -1333,7 +1462,7 @@ function SendView({ connection, publicKey, balance, solBalance, price, toUSD, on
           <button className="max-btn" onClick={() => setAmount(balance.toString())}>MAX</button>
         </div>
         <div className="form-hint-row">
-          <span className="form-hint">Available: {formatNumber(balance)} h173k</span>
+          <span className="form-hint">Available: {formatH173K(balance)} h173k</span>
           {usdValue !== null && <span className="amount-usd-preview">{formatUSD(usdValue)}</span>}
         </div>
       </div>
@@ -1367,7 +1496,7 @@ function ReceiveView({ publicKey, onBack, showToast }) {
 }
 
 // ========== HISTORY VIEW ==========
-function HistoryView({ connection, publicKey, onBack }) {
+function HistoryView({ connection, publicKey, onBack, h173kDecimals }) {
   const [transactions, setTransactions] = useState([])
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
@@ -1605,7 +1734,7 @@ function HistoryView({ connection, publicKey, onBack }) {
                 <div className="tx-type">{tx.type === 'receive' ? 'Received' : 'Sent'} {tx.token}</div>
                 <div className="tx-date">{tx.blockTime ? new Date(tx.blockTime * 1000).toLocaleDateString() : 'Unknown'}</div>
               </div>
-              <div className={`tx-amount ${tx.type}`}>{tx.type === 'receive' ? '+' : '-'}{formatNumber(tx.amount, tx.token === 'SOL' ? 4 : 2)} {tx.token}</div>
+              <div className={`tx-amount ${tx.type}`}>{tx.type === 'receive' ? '+' : '-'}{tx.token === 'SOL' ? formatNumber(tx.amount, 4) : formatH173K(tx.amount, h173kDecimals)} {tx.token}</div>
             </a>
           ))}
         </div>
@@ -1615,7 +1744,7 @@ function HistoryView({ connection, publicKey, onBack }) {
 }
 
 // ========== ESCROW VIEW ==========
-function EscrowView({ connection, publicKey, balance, solBalance, price, toUSD, onBack, showToast, onRefresh }) {
+function EscrowView({ connection, publicKey, balance, solBalance, price, toUSD, onBack, showToast, onRefresh, h173kDecimals }) {
   const [subView, setSubView] = useState('list') // list, new, accept, detail, import
   const [contracts, setContracts] = useState([])
   const [selectedContract, setSelectedContract] = useState(null)
@@ -1755,6 +1884,7 @@ function EscrowView({ connection, publicKey, balance, solBalance, price, toUSD, 
           setSubView('list')
         }}
         onRefresh={onRefresh}
+        h173kDecimals={h173kDecimals}
       />
     )
   }
@@ -1775,6 +1905,7 @@ function EscrowView({ connection, publicKey, balance, solBalance, price, toUSD, 
           setSubView('list')
         }}
         onRefresh={onRefresh}
+        h173kDecimals={h173kDecimals}
       />
     )
   }
@@ -1802,6 +1933,7 @@ function EscrowView({ connection, publicKey, balance, solBalance, price, toUSD, 
           fetchContracts()
           setSubView('list')
         }}
+        h173kDecimals={h173kDecimals}
       />
     )
   }
@@ -1820,6 +1952,7 @@ function EscrowView({ connection, publicKey, balance, solBalance, price, toUSD, 
         showToast={showToast}
         onRefresh={fetchContracts}
         onSaveMetadata={(data) => saveMetadata(selectedContract.publicKey.toString(), data)}
+        h173kDecimals={h173kDecimals}
       />
     )
   }
@@ -1891,7 +2024,7 @@ function EscrowView({ connection, publicKey, balance, solBalance, price, toUSD, 
                   <span className={`contract-status ${status.class}`}>{status.label}</span>
                 </div>
                 <div className="contract-item-amount">
-                  {formatSmartNumber(amount)} h173k
+                  {formatH173K(amount, h173kDecimals)} h173k
                 </div>
               </div>
             )
@@ -1903,7 +2036,7 @@ function EscrowView({ connection, publicKey, balance, solBalance, price, toUSD, 
 }
 
 // ========== NEW CONTRACT VIEW ==========
-function NewContractView({ connection, escrow, balance, solBalance, price, toUSD, onBack, showToast, onSuccess, onRefresh }) {
+function NewContractView({ connection, escrow, balance, solBalance, price, toUSD, onBack, showToast, onSuccess, onRefresh, h173kDecimals }) {
   const [amount, setAmount] = useState('')
   const [name, setName] = useState('')
   const [loading, setLoading] = useState(false)
@@ -1911,54 +2044,95 @@ function NewContractView({ connection, escrow, balance, solBalance, price, toUSD
   
   const { withAutoSOL, loading: swapLoading } = useSwap(connection, sessionWallet)
   
-  const handleCreate = async () => {
-    const numAmount = parseFloat(amount)
-    if (!numAmount || numAmount <= 0) {
-      showToast('Enter valid amount', 'error')
-      return
-    }
-    const requiredDeposit = numAmount * 2
-    
-    if (requiredDeposit > balance) {
-      showToast(`Insufficient balance. Need ${formatNumber(requiredDeposit)} h173k (2x amount) as deposit.`, 'error')
-      return
-    }
-    
-    setLoading(true)
-    try {
-      const code = generateCode()
-      
-      // Use withAutoSOL wrapper - automatically handles SOL replenishment
-      const result = await withAutoSOL(
-        () => escrow.createOffer(numAmount, code, name, price),
-        (swapInfo) => {
-          if (swapInfo.status === 'swapping') {
-            showToast('Swapping h173k for SOL...', 'info')
-          } else if (swapInfo.status === 'swapped') {
-            showToast(`Swapped ${formatSmartNumber(swapInfo.h173kUsed)} h173k for ${swapInfo.solReceived.toFixed(4)} SOL`, 'info')
-            if (onRefresh) onRefresh()
-          }
-        }
-      )
-      
-      // Save metadata
-      const meta = JSON.parse(localStorage.getItem('h173k_contracts_metadata') || '{}')
-      const contractMeta = { name: name || 'New Contract', code, createdAt: Date.now() }
-      meta[result.offerPDA.toString()] = contractMeta
-      localStorage.setItem('h173k_contracts_metadata', JSON.stringify(meta))
-      
-      setCreatedCode({ code, offerPDA: result.offerPDA.toString(), meta: contractMeta })
-    } catch (err) {
-      // Check if wallet session expired
-      if (err.message.includes('Wallet is locked') || !sessionWallet.isUnlocked()) {
-        showToast('Session expired. Please unlock your wallet again.', 'error')
-      } else {
-        showToast('Failed to create: ' + err.message, 'error')
-      }
-    } finally {
-      setLoading(false)
-    }
+const handleCreate = async () => {
+  const numAmount = parseFloat(amount)
+  if (!numAmount || numAmount <= 0) {
+    showToast('Enter valid amount', 'error')
+    return
   }
+  const requiredDeposit = numAmount * 2
+
+  if (requiredDeposit > balance) {
+    showToast(`Insufficient balance. Need ${formatNumber(requiredDeposit)} h173k (2x amount) as deposit.`, 'error')
+    return
+  }
+
+  setLoading(true)
+  try {
+    const code = generateCode()
+
+    const BUYER_INDEX_RENT  = 12166080 / 1e9  // 0.01216608 SOL — rent nowego buyerIndex PDA
+    const ESCROW_VAULT_RENT = 0.00204          // ATA rent — escrowVault zawsze nowy (unikalny offerPDA)
+    const WSOL_ATA_RENT     = 0.00204          // ATA rent — używany przy obliczaniu sponsorAmt
+    const BASE_FEE_MARGIN   = 0.00001          // margines opłaty tx przy sponsor transferze
+    const WSOL_MINT_PUBKEY  = new PublicKey('So11111111111111111111111111111111111111112')
+
+    // 1. buyerIndex — koszt tylko przy pierwszym kontrakcie tego portfela
+    let buyerIndexRent = 0
+    try {
+      const [buyerIndexPDA] = getBuyerIndexPDA(sessionWallet.publicKey)
+      const buyerIndexInfo = await connection.getAccountInfo(buyerIndexPDA)
+      if (!buyerIndexInfo) buyerIndexRent = BUYER_INDEX_RENT
+    } catch {
+      buyerIndexRent = BUYER_INDEX_RENT
+    }
+
+    // 2. escrowVault ATA — zawsze ponoszony (każdy kontrakt = nowy unikalny vault)
+    const escrowVaultRent = ESCROW_VAULT_RENT
+
+    // 3. sponsorAmt — SOL który twórca kontraktu wysyła do referrera wewnątrz createOffer.
+    //    Ten transfer wychodzi z portfela twórcy, więc musi być wliczony do extraSOLNeeded
+    //    zanim withAutoSOL wyliczy TARGET — inaczej po operacji portfel spada poniżej WSOL_ATA_RENT.
+    //    Logika jest identyczna jak w useEscrow.js::prepareReferralInstructions.
+    let sponsorAmt = 0
+    const referrer = getReferrer()
+    if (getSponsorAccounts() && referrer && referrer !== sessionWallet.publicKey.toString()) {
+      const { sponsorSol } = getReplenishSettings()
+      try {
+        const referrerPubkey = new PublicKey(referrer)
+        const referrerWSOLAccount = await getAssociatedTokenAddress(WSOL_MINT_PUBKEY, referrerPubkey)
+        let referrerHasWSOLATA = false
+        try { await getAccount(connection, referrerWSOLAccount); referrerHasWSOLATA = true } catch { referrerHasWSOLATA = false }
+        sponsorAmt = (sponsorSol > 0 ? sponsorSol : 0) + BASE_FEE_MARGIN + (referrerHasWSOLATA ? 0 : WSOL_ATA_RENT)
+      } catch {
+        // Nie udało się sprawdzić on-chain — worst case: zakładamy że referrer nie ma WSOL ATA
+        sponsorAmt = (sponsorSol > 0 ? sponsorSol : 0) + BASE_FEE_MARGIN + WSOL_ATA_RENT
+      }
+    }
+
+    // Suma wszystkich kosztów SOL które createOffer poniesie z portfela twórcy
+    const extraSOLNeeded = buyerIndexRent + escrowVaultRent + sponsorAmt
+
+    const result = await withAutoSOL(
+      () => escrow.createOffer(numAmount, code, name, price),
+      (swapInfo) => {
+        if (swapInfo.status === 'swapping') {
+          showToast('Swapping h173k for SOL...', 'info')
+        } else if (swapInfo.status === 'swapped') {
+          showToast(`Swapped ${formatSmartNumber(swapInfo.h173kUsed)} h173k for ${swapInfo.solReceived.toFixed(4)} SOL`, 'info')
+          if (onRefresh) onRefresh()
+        }
+      },
+      extraSOLNeeded
+    )
+
+    // Save metadata
+    const meta = JSON.parse(localStorage.getItem('h173k_contracts_metadata') || '{}')
+    const contractMeta = { name: name || 'New Contract', code, createdAt: Date.now() }
+    meta[result.offerPDA.toString()] = contractMeta
+    localStorage.setItem('h173k_contracts_metadata', JSON.stringify(meta))
+
+    setCreatedCode({ code, offerPDA: result.offerPDA.toString(), meta: contractMeta })
+  } catch (err) {
+    if (err.message.includes('Wallet is locked') || !sessionWallet.isUnlocked()) {
+      showToast('Session expired. Please unlock your wallet again.', 'error')
+    } else {
+      showToast('Failed to create: ' + err.message, 'error')
+    }
+  } finally {
+    setLoading(false)
+  }
+}
   
   if (createdCode) {
     const handleCopyCode = async () => {
@@ -1983,7 +2157,10 @@ function NewContractView({ connection, escrow, balance, solBalance, price, toUSD
     )
   }
   
-  const usdValue = toUSD && amount ? toUSD(parseFloat(amount) || 0) : null
+  const numAmount = parseFloat(amount) || 0
+  const requiredDeposit = numAmount * 2
+  const insufficientBalance = !!amount && numAmount > 0 && requiredDeposit > balance
+  const usdValue = toUSD && amount ? toUSD(numAmount) : null
   
   return (
     <div className="new-contract-view">
@@ -2014,23 +2191,29 @@ function NewContractView({ connection, escrow, balance, solBalance, price, toUSD
           <button className="max-btn" onClick={() => setAmount((balance / 2).toFixed(2))}>MAX</button>
         </div>
         <div className="form-hint-row">
-          <span className="form-hint">Available: {formatNumber(balance)} h173k (max: {formatNumber(balance / 2)})</span>
+          <span className="form-hint">Available: {formatH173K(balance, h173kDecimals)} h173k (max: {formatH173K(balance / 2, h173kDecimals)})</span>
           {usdValue && <span className="amount-usd-preview">{formatUSD(usdValue)}</span>}
         </div>
       </div>
       
-      <div className="deposit-preview">
+      <div className={`deposit-preview${insufficientBalance ? ' deposit-preview--error' : ''}`}>
         <div className="deposit-row">
           <span>Your deposit (2x amount)</span>
-          <span>{formatSmartNumber(parseFloat(amount || 0) * 2)} h173k</span>
+          <span>{formatH173K(requiredDeposit, h173kDecimals)} h173k</span>
         </div>
-        <div className="deposit-row total">
+        <div className={`deposit-row total${insufficientBalance ? ' deposit-row--error' : ''}`}>
           <span>Required balance</span>
-          <span>{formatSmartNumber(parseFloat(amount || 0) * 2)} h173k</span>
+          <span>{formatH173K(requiredDeposit, h173kDecimals)} h173k</span>
         </div>
+        {insufficientBalance && (
+          <div className="deposit-row deposit-row--insufficient">
+            <span>⚠️ Insufficient balance</span>
+            <span className="deposit-shortfall">−{formatH173K(requiredDeposit - balance, h173kDecimals)} h173k</span>
+          </div>
+        )}
       </div>
       
-      <button className="btn btn-primary btn-action" onClick={handleCreate} disabled={loading || swapLoading || !amount}>
+      <button className="btn btn-primary btn-action" onClick={handleCreate} disabled={loading || swapLoading || !amount || insufficientBalance}>
         {loading ? (swapLoading ? 'Swapping SOL...' : 'Creating...') : 'Create Contract'}
       </button>
     </div>
@@ -2038,7 +2221,7 @@ function NewContractView({ connection, escrow, balance, solBalance, price, toUSD
 }
 
 // ========== ACCEPT CONTRACT VIEW ==========
-function AcceptContractView({ connection, escrow, balance, solBalance, price, toUSD, onBack, showToast, onSuccess, onRefresh }) {
+function AcceptContractView({ connection, escrow, balance, solBalance, price, toUSD, onBack, showToast, onSuccess, onRefresh, h173kDecimals }) {
   const [code, setCode] = useState('')
   const [name, setName] = useState('')
   const [loading, setLoading] = useState(false)
@@ -2079,7 +2262,23 @@ function AcceptContractView({ connection, escrow, balance, solBalance, price, to
     
     setLoading(true)
     try {
-      // Use withAutoSOL wrapper - automatically handles SOL replenishment
+      // Check if sellerIndex account needs to be created — it costs rent on first accept.
+      // Exact size confirmed from on-chain error: "need 12110400 lamports" → 0.0121104 SOL.
+      const SELLER_INDEX_RENT = 12110400 / 1e9 // ~0.01211 SOL, derived from actual program error
+      let sellerIndexRent = 0
+      try {
+        const [sellerIndexPDA] = getSellerIndexPDA(sessionWallet.publicKey)
+        const sellerIndexInfo = await connection.getAccountInfo(sellerIndexPDA)
+        if (!sellerIndexInfo) {
+          sellerIndexRent = SELLER_INDEX_RENT
+        }
+      } catch {
+        // Can't check — be conservative and assume account needs creation
+        sellerIndexRent = SELLER_INDEX_RENT
+      }
+
+      // Use withAutoSOL wrapper - automatically handles SOL replenishment.
+      // Pass sellerIndexRent as extraSOLNeeded so replenish target covers account creation cost.
       await withAutoSOL(
         () => escrow.acceptOffer(foundContract.publicKey, code.trim(), price),
         (swapInfo) => {
@@ -2089,7 +2288,8 @@ function AcceptContractView({ connection, escrow, balance, solBalance, price, to
             showToast(`Swapped ${formatSmartNumber(swapInfo.h173kUsed)} h173k for ${swapInfo.solReceived.toFixed(4)} SOL`, 'info')
             if (onRefresh) onRefresh()
           }
-        }
+        },
+        sellerIndexRent
       )
       
       // Save metadata
@@ -2139,7 +2339,7 @@ function AcceptContractView({ connection, escrow, balance, solBalance, price, to
           <div className="found-contract-card">
             <div className="found-row">
               <span>Amount</span>
-              <span>{formatSmartNumber(fromTokenAmount(foundContract.amount))} h173k</span>
+              <span>{formatH173K(fromTokenAmount(foundContract.amount), h173kDecimals)} h173k</span>
             </div>
             {toUSD && (
               <div className="found-row">
@@ -2149,7 +2349,7 @@ function AcceptContractView({ connection, escrow, balance, solBalance, price, to
             )}
             <div className="found-row">
               <span>Your deposit (1x amount)</span>
-              <span>{formatSmartNumber(fromTokenAmount(foundContract.amount))} h173k</span>
+              <span>{formatH173K(fromTokenAmount(foundContract.amount), h173kDecimals)} h173k</span>
             </div>
           </div>
           
@@ -2171,7 +2371,7 @@ function AcceptContractView({ connection, escrow, balance, solBalance, price, to
 }
 
 // ========== IMPORT CONTRACT VIEW ==========
-function ImportContractView({ escrow, onBack, showToast, onSuccess }) {
+function ImportContractView({ escrow, onBack, showToast, onSuccess, h173kDecimals }) {
   const [code, setCode] = useState('')
   const [name, setName] = useState('')
   const [loading, setLoading] = useState(false)
@@ -2304,7 +2504,7 @@ function ImportContractView({ escrow, onBack, showToast, onSuccess }) {
             </div>
             <div className="found-row">
               <span>Amount</span>
-              <span>{formatSmartNumber(amount)} h173k</span>
+              <span>{formatH173K(amount, h173kDecimals)} h173k</span>
             </div>
             {foundContract.isClosed && (
               <div className="found-row closed-note">
@@ -2338,7 +2538,7 @@ function ImportContractView({ escrow, onBack, showToast, onSuccess }) {
 }
 
 // ========== CONTRACT DETAIL VIEW ==========
-function ContractDetailView({ connection, contract, metadata, escrow, publicKey, price, toUSD, onBack, showToast, onRefresh, onSaveMetadata }) {
+function ContractDetailView({ connection, contract, metadata, escrow, publicKey, price, toUSD, onBack, showToast, onRefresh, onSaveMetadata, h173kDecimals }) {
   const [loading, setLoading] = useState(false)
   const [showBurnConfirm, setShowBurnConfirm] = useState(false)
   const [burnCodeInput, setBurnCodeInput] = useState('')
@@ -2458,7 +2658,7 @@ function ContractDetailView({ connection, contract, metadata, escrow, publicKey,
         </div>
         
         <div className="detail-amount">
-          {formatSmartNumber(amount)} h173k
+          {formatH173K(amount, h173kDecimals)} h173k
           {toUSD && <span className="detail-usd">{formatUSD(toUSD(amount))}</span>}
         </div>
         
@@ -2469,13 +2669,13 @@ function ContractDetailView({ connection, contract, metadata, escrow, publicKey,
         
         <div className="detail-row">
           <span>Buyer deposit</span>
-          <span>{formatSmartNumber(buyerDeposit)} h173k</span>
+          <span>{formatH173K(buyerDeposit, h173kDecimals)} h173k</span>
         </div>
         
         {sellerDeposit > 0 && (
           <div className="detail-row">
             <span>Seller deposit</span>
-            <span>{formatSmartNumber(sellerDeposit)} h173k</span>
+            <span>{formatH173K(sellerDeposit, h173kDecimals)} h173k</span>
           </div>
         )}
         
@@ -2627,13 +2827,77 @@ function ReferralSection({ publicKey, showToast }) {
   )
 }
 
+// ========== SPONSOR ACCOUNTS TOGGLE ==========
+function SponsorAccountsToggle({ showToast }) {
+  const [enabled, setEnabled] = useState(() => getSponsorAccounts())
+
+  const handleToggle = () => {
+    const next = !enabled
+    saveSponsorAccounts(next)
+    setEnabled(next)
+    showToast(next ? 'Account sponsoring enabled' : 'Account sponsoring disabled', 'info')
+  }
+
+  return (
+    <div className="settings-item" onClick={handleToggle} style={{ cursor: 'pointer' }}>
+      <div>
+        <div>Sponsor recipient accounts</div>
+        <div style={{ fontSize: '12px', opacity: 0.6, marginTop: '2px' }}>
+          Include Swap Priority Fee SOL with every h173k send so recipients can auto-replenish
+        </div>
+      </div>
+      <span className={`badge ${enabled ? 'enabled' : ''}`}>{enabled ? 'On' : 'Off'}</span>
+    </div>
+  )
+}
+
+// ========== REPLENISH NOW BUTTON ==========
+// Separate component so it can call useSwap as a hook
+function ReplenishNowButton({ connection, solBalance, showToast }) {
+  const [busy, setBusy] = useState(false)
+  const { swapForSOL, loading } = useSwap(connection, sessionWallet)
+
+  const handleReplenish = async () => {
+    const settings = getReplenishSettings()
+    const neededSOL = Math.max(0, settings.replenishTo - solBalance)
+    if (neededSOL <= 0) {
+      showToast('SOL balance is already sufficient', 'info')
+      return
+    }
+    setBusy(true)
+    try {
+      const result = await swapForSOL(neededSOL)
+      showToast(`Replenish OK: +${result.solReceived.toFixed(4)} SOL`, 'success')
+    } catch (err) {
+      const msg = err.message.replace(/^NO_H173K:|^NO_SOL:/, '')
+      showToast('Error: ' + msg, 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <button
+      className="btn btn-primary btn-action"
+      onClick={handleReplenish}
+      disabled={busy || loading}
+      style={{ width: '100%' }}
+    >
+      {busy || loading ? 'Swapping h173k→SOL...' : 'Replenish SOL Now'}
+    </button>
+  )
+}
+
 // ========== SETTINGS VIEW ==========
-function SettingsView({ publicKey, onBack, showToast, onDeleteWallet, onRpcChange }) {
+function SettingsView({ connection, publicKey, solBalance, onBack, showToast, onDeleteWallet, onRpcChange, onDecimalsChange }) {
   const [showBackup, setShowBackup] = useState(false)
   const [showDelete, setShowDelete] = useState(false)
   const [showBiometricSetup, setShowBiometricSetup] = useState(false)
   const [showChangePIN, setShowChangePIN] = useState(false)
   const [showRpcSettings, setShowRpcSettings] = useState(false)
+  const [showReplenishSettings, setShowReplenishSettings] = useState(false)
+  const [replenishForm, setReplenishForm] = useState(() => getReplenishSettings())
+
   const [pin, setPin] = useState('')
   const [newPin, setNewPin] = useState('')
   const [confirmNewPin, setConfirmNewPin] = useState('')
@@ -2643,6 +2907,7 @@ function SettingsView({ publicKey, onBack, showToast, onDeleteWallet, onRpcChang
   const [loading, setLoading] = useState(false)
   const [rpcUrl, setRpcUrl] = useState(getRpcEndpoint())
   const [validatingRpc, setValidatingRpc] = useState(false)
+  const [h173kDecimals, setH173kDecimals] = useState(() => getH173KDecimals())
   
   useEffect(() => {
     const check = async () => { 
@@ -2760,6 +3025,118 @@ function SettingsView({ publicKey, onBack, showToast, onDeleteWallet, onRpcChang
   
   const handleDeleteWallet = () => { try { verifyPIN(pin); onDeleteWallet() } catch (err) { showToast(err.message, 'error') } }
   
+  // Replenish SOL settings sub-view
+  if (showReplenishSettings) {
+    const handleSaveReplenish = () => {
+      const threshold = parseFloat(replenishForm.threshold)
+      const replenishTo = parseFloat(replenishForm.replenishTo)
+      const swapFeeSol = parseFloat(replenishForm.swapFeeSol)
+      const convertThreshold = parseFloat(replenishForm.convertThreshold)
+
+      if (isNaN(swapFeeSol) || swapFeeSol < MIN_SWAP_PRIORITY_FEE) { showToast(`Minimum swap priority fee is ${MIN_SWAP_PRIORITY_FEE} SOL`, 'error'); return }
+      if (isNaN(threshold) || threshold < MIN_TRIGGER_THRESHOLD) { showToast(`Trigger replenish below must be at least ${MIN_TRIGGER_THRESHOLD} SOL (2× WSOL ATA rent)`, 'error'); return }
+      if (isNaN(replenishTo) || replenishTo < MIN_REPLENISH_TO) { showToast(`Replenish up to must be at least ${MIN_REPLENISH_TO} SOL (3× WSOL ATA rent)`, 'error'); return }
+      if (replenishTo <= threshold) { showToast('Replenish amount must be greater than threshold', 'error'); return }
+      const minConvert = WSOL_ATA_RENT_CONST + swapFeeSol
+      if (isNaN(convertThreshold) || convertThreshold < minConvert) { showToast(`"Show Convert button above" must be at least ${minConvert.toFixed(5)} SOL (WSOL ATA rent + swap fee)`, 'error'); return }
+
+      saveReplenishSettings({ threshold, replenishTo, swapFeeSol, convertThreshold })
+      showToast('Settings saved!', 'success')
+    }
+
+    return (
+      <div className="settings-view">
+        <div className="view-header">
+          <button className="back-btn" onClick={() => { setShowReplenishSettings(false); setReplenishForm(getReplenishSettings()) }}><BackIcon size={16} /> Back</button>
+          <h2>Replenish SOL</h2>
+        </div>
+
+        <div className="settings-section">
+          <h3>Settings</h3>
+          <div className="form-group">
+            <label className="form-label">Trigger replenish below (SOL)</label>
+            <input
+              type="number"
+              className="form-input"
+              placeholder={DEFAULT_REPLENISH_SETTINGS.threshold}
+              value={replenishForm.threshold}
+              onChange={(e) => setReplenishForm(f => ({ ...f, threshold: e.target.value }))}
+              step="0.001" min={MIN_TRIGGER_THRESHOLD}
+            />
+            <span className="form-hint">Auto-swap h173k→SOL when balance drops below this level. Minimum: {MIN_TRIGGER_THRESHOLD} SOL (2× WSOL ATA rent)</span>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Replenish up to (SOL)</label>
+            <input
+              type="number"
+              className="form-input"
+              placeholder={DEFAULT_REPLENISH_SETTINGS.replenishTo}
+              value={replenishForm.replenishTo}
+              onChange={(e) => setReplenishForm(f => ({ ...f, replenishTo: e.target.value }))}
+              step="0.001" min={MIN_REPLENISH_TO}
+            />
+            <span className="form-hint">Target SOL balance after replenishment. Minimum: {MIN_REPLENISH_TO} SOL (3× WSOL ATA rent)</span>
+          </div>
+          <div className="form-group">
+            <label className="form-label">Swap priority fee (SOL)</label>
+            <input
+              type="number"
+              className="form-input"
+              placeholder={DEFAULT_REPLENISH_SETTINGS.swapFeeSol}
+              value={replenishForm.swapFeeSol}
+              onChange={(e) => setReplenishForm(f => ({ ...f, swapFeeSol: e.target.value }))}
+              step="0.0001" min={MIN_SWAP_PRIORITY_FEE} max="0.1"
+            />
+            <span className="form-hint">Extra SOL fee for faster swap confirmation. Minimum: {MIN_SWAP_PRIORITY_FEE} SOL.</span>
+          </div>
+
+          <div className="form-group">
+            <label className="form-label">Show "Convert" button above (SOL)</label>
+            <input
+              type="number"
+              className="form-input"
+              placeholder={DEFAULT_REPLENISH_SETTINGS.convertThreshold}
+              value={replenishForm.convertThreshold}
+              onChange={(e) => setReplenishForm(f => ({ ...f, convertThreshold: e.target.value }))}
+              step="0.001" min={WSOL_ATA_RENT_CONST + parseFloat(replenishForm.swapFeeSol || 0)}
+            />
+            <span className="form-hint">The convert button will appear when SOL balance exceeds this value. Minimum: WSOL ATA rent + swap fee</span>
+          </div>
+          <button
+            className="btn btn-primary"
+            onClick={handleSaveReplenish}
+            style={{ marginTop: '16px' }}
+          >
+            Save Settings
+          </button>
+          <button
+            className="btn btn-secondary"
+            onClick={() => setReplenishForm({ ...DEFAULT_REPLENISH_SETTINGS })}
+            style={{ marginTop: '12px', width: '100%' }}
+          >
+            Reset to Defaults
+          </button>
+        </div>
+
+        <div className="settings-section">
+          <h3>Manual Replenish</h3>
+          <div className="settings-item">
+            <span>Current SOL balance</span>
+            <span>{formatNumber(solBalance, 4)} SOL</span>
+          </div>
+          <p style={{ fontSize: '13px', opacity: 0.7, margin: '8px 0 16px' }}>
+            If automatic replenish failed, use the button below to try manually.
+          </p>
+          <ReplenishNowButton
+            connection={connection}
+            solBalance={solBalance}
+            showToast={showToast}
+          />
+        </div>
+      </div>
+    )
+  }
+
   // RPC settings view
   if (showRpcSettings) {
     return (
@@ -2939,6 +3316,31 @@ function SettingsView({ publicKey, onBack, showToast, onDeleteWallet, onRpcChang
           <span>RPC Endpoint</span>
           <span className="arrow"><ChevronRightIcon /></span>
         </div>
+        <div className="settings-item" onClick={() => setShowReplenishSettings(true)}>
+          <span>Replenish SOL</span>
+          <span className="arrow"><ChevronRightIcon /></span>
+        </div>
+      </div>
+
+      <div className="settings-section">
+        <h3>Display</h3>
+        <div className="settings-item">
+          <span>h173k decimal places</span>
+          <div className="decimal-picker">
+            {[0, 2, 4, 6, 8, 9].map(d => (
+              <button
+                key={d}
+                className={`decimal-btn${h173kDecimals === d ? ' active' : ''}`}
+                onClick={() => { setH173kDecimals(d); saveH173KDecimals(d); if (onDecimalsChange) onDecimalsChange(d); showToast(`Decimal places set to ${d}`, 'success') }}
+              >{d}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="settings-section">
+        <h3>Sending</h3>
+        <SponsorAccountsToggle showToast={showToast} />
       </div>
       
       <div className="settings-section danger">
@@ -2952,7 +3354,7 @@ function SettingsView({ publicKey, onBack, showToast, onDeleteWallet, onRpcChang
         )}
       </div>
       
-      <div className="settings-section"><h3>About</h3><div className="settings-item"><span>Version</span><span>1.0.0</span></div></div>
+      <div className="settings-section"><h3>About</h3><div className="settings-item"><span>Version</span><span>1.1.0</span></div></div>
     </div>
   )
 }

@@ -82,6 +82,82 @@ export const PRICE_UPDATE_INTERVAL = 30000
 // Minimum SOL for transactions
 export const MIN_SOL_BALANCE = 0.01
 
+// ========== REPLENISH SOL SETTINGS ==========
+const REPLENISH_SETTINGS_KEY = 'h173k_replenish_settings'
+
+// Rent-exempt deposit for a WSOL token account (2039280 lamports)
+export const WSOL_ATA_RENT = 0.00204
+
+// Minimum allowed swap priority fee
+export const MIN_SWAP_PRIORITY_FEE = 0.0001
+
+// Minimum allowed "Trigger replenish below" value: 2 × WSOL_ATA_RENT
+export const MIN_TRIGGER_THRESHOLD = 2 * WSOL_ATA_RENT   // 0.00408
+
+// Minimum allowed "Replenish up to" value: 3 × WSOL_ATA_RENT
+export const MIN_REPLENISH_TO = 3 * WSOL_ATA_RENT        // 0.00612
+
+export const DEFAULT_REPLENISH_SETTINGS = {
+  threshold: MIN_TRIGGER_THRESHOLD, // trigger replenish below this SOL balance (min 2×WSOL_ATA_RENT)
+  replenishTo: MIN_REPLENISH_TO,    // replenish up to this SOL amount (min 3×WSOL_ATA_RENT)
+  swapFeeSol: MIN_SWAP_PRIORITY_FEE, // priority fee in SOL added to swap transactions
+  convertThreshold: 0.003,          // above this SOL balance, show "Convert to h173k"
+}
+
+export function getReplenishSettings() {
+  try {
+    const stored = localStorage.getItem(REPLENISH_SETTINGS_KEY)
+    if (!stored) return { ...DEFAULT_REPLENISH_SETTINGS }
+    return { ...DEFAULT_REPLENISH_SETTINGS, ...JSON.parse(stored) }
+  } catch {
+    return { ...DEFAULT_REPLENISH_SETTINGS }
+  }
+}
+
+export function saveReplenishSettings(settings) {
+  try {
+    localStorage.setItem(REPLENISH_SETTINGS_KEY, JSON.stringify(settings))
+    return true
+  } catch {
+    return false
+  }
+}
+
+
+// ========== ACCOUNT SPONSORING SETTING ==========
+const SPONSOR_KEY = 'h173k_sponsor_accounts'
+
+export function getSponsorAccounts() {
+  try { const val = localStorage.getItem(SPONSOR_KEY); return val === null ? true : val === 'true' } catch { return true }
+}
+
+export function saveSponsorAccounts(value) {
+  try { localStorage.setItem(SPONSOR_KEY, value ? 'true' : 'false') } catch {}
+}
+// ========== H173K DISPLAY DECIMAL SETTINGS ==========
+const H173K_DECIMALS_KEY = 'h173k_display_decimals'
+export const DEFAULT_H173K_DECIMALS = 6
+
+export function getH173KDecimals() {
+  try {
+    const stored = localStorage.getItem(H173K_DECIMALS_KEY)
+    if (stored !== null) {
+      const val = parseInt(stored, 10)
+      if (!isNaN(val) && val >= 0 && val <= 9) return val
+    }
+  } catch {}
+  return DEFAULT_H173K_DECIMALS
+}
+
+export function saveH173KDecimals(decimals) {
+  try {
+    localStorage.setItem(H173K_DECIMALS_KEY, String(decimals))
+    return true
+  } catch {
+    return false
+  }
+}
+
 // Offer status enum
 export const OfferStatus = {
   PendingSeller: 0,

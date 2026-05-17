@@ -5,7 +5,7 @@
 import { PublicKey } from '@solana/web3.js'
 import { BN } from '@coral-xyz/anchor'
 import { sha256 } from '@noble/hashes/sha256'
-import { TOKEN_DECIMALS, PROGRAM_ID, OfferStatus } from './constants'
+import { TOKEN_DECIMALS, PROGRAM_ID, OfferStatus, getH173KDecimals } from './constants'
 
 /**
  * Format number with commas
@@ -79,8 +79,30 @@ export function formatSmartNumber(num, minDecimals = 2, maxDecimals = 8) {
 }
 
 /**
- * Format USD amount
+ * Format h173k amount using user-configured decimal places from settings
  */
+export function formatH173K(num, decimalsOverride) {
+  if (num === null || num === undefined || isNaN(num)) return '0'
+  const decimals = decimalsOverride !== undefined ? decimalsOverride : getH173KDecimals()
+  if (decimals === 0) {
+    return num.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })
+  }
+  // Use smart formatting as base but cap/floor to configured decimals
+  const absNum = Math.abs(num)
+  if (num === 0) return '0'
+
+  // For very small numbers below configured precision, fall back to smart display
+  if (absNum > 0 && absNum < Math.pow(10, -decimals)) {
+    return formatSmartNumber(num, decimals, Math.max(decimals, 8))
+  }
+
+  return num.toLocaleString('en-US', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: decimals,
+  })
+}
+
+
 export function formatUSD(amount) {
   if (amount === null || amount === undefined || isNaN(amount)) return '$0.00'
   return new Intl.NumberFormat('en-US', {

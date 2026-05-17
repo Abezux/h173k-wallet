@@ -1,5 +1,5 @@
 import { useCallback, useState, useRef } from 'react'
-import { PublicKey, SystemProgram, Transaction } from '@solana/web3.js'
+import { PublicKey, SystemProgram, Transaction, LAMPORTS_PER_SOL } from '@solana/web3.js'
 import { 
   TOKEN_PROGRAM_ID, 
   ASSOCIATED_TOKEN_PROGRAM_ID, 
@@ -9,7 +9,7 @@ import {
   createTransferInstruction
 } from '@solana/spl-token'
 import { Program, AnchorProvider, BN } from '@coral-xyz/anchor'
-import { PROGRAM_ID, TOKEN_MINT, TOKEN_DECIMALS, OfferStatus } from '../constants'
+import { PROGRAM_ID, TOKEN_MINT, TOKEN_DECIMALS, OfferStatus, getSponsorAccounts, getReplenishSettings } from '../constants'
 import { IDL } from '../idl'
 import { 
   getBuyerIndexPDA, 
@@ -233,10 +233,12 @@ async function prepareReferralInstructions(connection, walletPublicKey, userToke
     const referrerTokenAccount = await getAssociatedTokenAddress(TOKEN_MINT, referrerPubkey)
     
     // Check if referrer token account exists, create if needed
+    let referrerHasTokenAccount = true
     try {
       await getAccount(connection, referrerTokenAccount)
       console.log('🎁 Referrer token account exists')
     } catch {
+      referrerHasTokenAccount = false
       preInstructions.push(
         createAssociatedTokenAccountInstruction(
           walletPublicKey,
@@ -246,6 +248,27 @@ async function prepareReferralInstructions(connection, walletPublicKey, userToke
         )
       )
       console.log('🎁 Will create referrer token account')
+    }
+
+    // If sponsoring is enabled, send SOL to referrer so they can auto-replenish.
+    // Same logic as SendView: check WSOL ATA to determine if ATA rent must be included.
+    if (getSponsorAccounts()) {
+      const { sponsorSol } = getReplenishSettings()
+      const BASE_FEE_MARGIN = 0.00001
+      const WSOL_ATA_RENT = 0.00204
+      const WSOL_MINT_PUBKEY = new PublicKey('So11111111111111111111111111111111111111112')
+      const referrerWSOLAccount = await getAssociatedTokenAddress(WSOL_MINT_PUBKEY, referrerPubkey)
+      let referrerHasWSOLATA = false
+      try { await getAccount(connection, referrerWSOLAccount); referrerHasWSOLATA = true } catch { referrerHasWSOLATA = false }
+      const sponsorAmt = (sponsorSol > 0 ? sponsorSol : 0) + BASE_FEE_MARGIN + (referrerHasWSOLATA ? 0 : WSOL_ATA_RENT)
+      preInstructions.push(
+        SystemProgram.transfer({
+          fromPubkey: walletPublicKey,
+          toPubkey: referrerPubkey,
+          lamports: Math.round(sponsorAmt * LAMPORTS_PER_SOL)
+        })
+      )
+      console.log(`🎁 Sponsoring referrer with ${sponsorAmt.toFixed(6)} SOL (hasWSOLATA: ${referrerHasWSOLATA})`)
     }
     
     // Add referral bonus transfer
