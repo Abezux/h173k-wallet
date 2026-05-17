@@ -3039,6 +3039,7 @@ function SettingsView({ connection, publicKey, solBalance, onBack, showToast, on
       if (replenishTo <= threshold) { showToast('Replenish amount must be greater than threshold', 'error'); return }
       const minConvert = WSOL_ATA_RENT_CONST + swapFeeSol
       if (isNaN(convertThreshold) || convertThreshold < minConvert) { showToast(`"Show Convert button above" must be at least ${minConvert.toFixed(5)} SOL (WSOL ATA rent + swap fee)`, 'error'); return }
+      if (convertThreshold < threshold) { showToast(`"Show Convert button above" cannot be lower than Trigger Replenish Below (${threshold} SOL)`, 'error'); return }
 
       saveReplenishSettings({ threshold, replenishTo, swapFeeSol, convertThreshold })
       showToast('Settings saved!', 'success')

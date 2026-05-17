@@ -101,7 +101,7 @@ export const DEFAULT_REPLENISH_SETTINGS = {
   threshold: MIN_TRIGGER_THRESHOLD, // trigger replenish below this SOL balance (min 2×WSOL_ATA_RENT)
   replenishTo: MIN_REPLENISH_TO,    // replenish up to this SOL amount (min 3×WSOL_ATA_RENT)
   swapFeeSol: MIN_SWAP_PRIORITY_FEE, // priority fee in SOL added to swap transactions
-  convertThreshold: 0.003,          // above this SOL balance, show "Convert to h173k"
+  convertThreshold: MIN_TRIGGER_THRESHOLD, // above this SOL balance, show "Convert to h173k"
 }
 
 export function getReplenishSettings() {
