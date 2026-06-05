@@ -73,7 +73,7 @@ function P2POnboarding({ onDone, onBack, showToast }) {
       <div className="form-group">
         <label className="form-label">Nickname</label>
         <input className="form-input" value={nickname} maxLength={32}
-          onChange={(e) => setNickname(e.target.value)} placeholder="e.g. satoshi_ke" />
+          onChange={(e) => setNickname(e.target.value)} placeholder="e.g. satoshi" />
       </div>
 
       <div className="form-group">
@@ -479,7 +479,7 @@ function CreateOffer({ cur, defaultType, posting, solBalance, balance, price, on
           <label className="form-label">Price — {cur?.code} per $1 of h173k value</label>
           <input className="form-input" type="number" inputMode="decimal" min="0" step="any" value={pricePerUsd}
             style={errStyle(priceErr)}
-            onKeyDown={blockMinus} onChange={setNum(setPrice)} placeholder="e.g. 0.92 (EUR)" />
+            onKeyDown={blockMinus} onChange={setNum(setPrice)} placeholder={`Amount in ${cur?.code}`} />
           {type === 'sell' ? (
             // creator sends h173k and receives fiat → show fiat received
             <span className="form-hint">
