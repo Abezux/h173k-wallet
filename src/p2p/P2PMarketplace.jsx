@@ -342,8 +342,9 @@ function OfferDetail({ offer, cur, price, balance, isMine, posting, onClose, onC
   const amt = parseFloat(amount)
   const inRange = amt >= offer.minUsd && amt <= offer.maxUsd
   const calc = (amt > 0 && price > 0) ? computeTrade(offer, amt, price) : null
-  // h173k you must hold to run the MAD contract for THIS amount (only when you send h173k).
-  const neededForAmount = (sendsH173k && calc?.h173kAmount != null) ? calc.h173kAmount * 2 : null
+  // h173k you must hold to run the MAD contract for THIS amount (deposit: ×2 if you
+  // send h173k, ×1 if you receive it — for a buyer that equals what you receive).
+  const neededForAmount = (calc?.h173kAmount != null) ? calc.h173kAmount * multiplier : null
   const enoughForAmount = neededForAmount == null ? null : balance >= neededForAmount
 
   const setAmt = (e) => { const v = e.target.value; if (v === '' || (parseFloat(v) >= 0 && !v.includes('-'))) setAmount(v) }
@@ -393,6 +394,10 @@ function OfferDetail({ offer, cur, price, balance, isMine, posting, onClose, onC
               <>
                 <div className="deposit-row"><span>You receive</span><span><strong>≈ {formatH173K(calc.h173kAmount)} h173k</strong></span></div>
                 <div className="deposit-row"><span>You pay</span><span>{formatNumber(calc.fiatAmount, 2)} {cur?.code}</span></div>
+                <div className="deposit-row"><span>h173k needed (MAD)</span>
+                  <span style={{ color: enoughForAmount === false ? 'var(--color-error)' : undefined }}>
+                    ≈ {neededForAmount != null ? formatH173K(neededForAmount) : '—'} h173k
+                  </span></div>
               </>
             ) : (
               <>
@@ -416,7 +421,7 @@ function OfferDetail({ offer, cur, price, balance, isMine, posting, onClose, onC
           )}
         </div>
 
-        {viewerAction === 'sell' && neededForAmount != null && enoughForAmount === false && (
+        {neededForAmount != null && enoughForAmount === false && (
           <div className="escrow-info-card" style={{ borderColor: 'var(--color-error)' }}>
             <p style={{ color: 'var(--color-error)' }}>⚠ You need ≈ {formatH173K(neededForAmount)} h173k for this amount but have {formatH173K(balance)} h173k.</p>
           </div>
