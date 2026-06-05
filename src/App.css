@@ -3067,6 +3067,12 @@ body {
 }
 .p2p-card-sub { color: var(--color-white-50); font-size: 13px; }
 
+.p2p-card-action {
+  font-weight: var(--font-regular);
+  color: var(--color-white-50);
+  font-size: 13px;
+}
+
 .p2p-card-row {
   display: flex;
   justify-content: space-between;

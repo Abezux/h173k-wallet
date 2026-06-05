@@ -203,8 +203,8 @@ function P2PMain({ connection, publicKey, balance, solBalance, price, toUSD, onB
       {/* ===== Banner ===== */}
       <div className="p2p-banner">
         <div className="p2p-tabs">
-          <button className={`p2p-tab ${side === 'buy' ? 'active' : ''}`} onClick={() => { setSide('buy'); setPmFilter('') }}>Buy</button>
-          <button className={`p2p-tab ${side === 'sell' ? 'active' : ''}`} onClick={() => { setSide('sell'); setPmFilter('') }}>Sell</button>
+          <button className={`p2p-tab ${side === 'buy' ? 'active' : ''}`} onClick={() => { setSide('buy'); setPmFilter('') }}>Buy Offers</button>
+          <button className={`p2p-tab ${side === 'sell' ? 'active' : ''}`} onClick={() => { setSide('sell'); setPmFilter('') }}>Sell Offers</button>
         </div>
 
         <div className="p2p-controls">
@@ -300,7 +300,7 @@ function OfferCard({ offer, cur, price, isMine, onClick }) {
   return (
     <div className="contract-item p2p-card" onClick={onClick}>
       <div className="contract-item-header">
-        <span className="contract-name">{offer.nickname || 'anon'} {isMine && <span className="p2p-you">you</span>}</span>
+        <span className="contract-name">{offer.nickname || 'anon'} <span className="p2p-card-action">is {offer.type === 'sell' ? 'selling' : 'buying'}</span> {isMine && <span className="p2p-you">you</span>}</span>
         <span className={`contract-status ${offer.type === 'buy' ? 'ongoing' : 'released'}`}>{offer.type.toUpperCase()}</span>
       </div>
       <div className="p2p-card-price">
