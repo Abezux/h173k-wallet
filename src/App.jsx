@@ -294,7 +294,7 @@ function WalletApp({ connection, onRpcChange }) {
   // Check for referral code in URL on mount
   const [pendingReferral, setPendingReferral] = useState(() => getReferralFromURL())
   
-  const { price, toUSD } = useTokenPrice()
+  const { price, toUSD } = useTokenPrice(connection)
   
   // Store last known price for referral calculations
   useEffect(() => {
@@ -2053,6 +2053,7 @@ function EscrowView({ connection, publicKey, balance, solBalance, price, toUSD, 
                 </div>
                 <div className="contract-item-amount">
                   {formatH173K(amount, h173kDecimals)} h173k
+                  {toUSD && <span className="contract-item-usd">{formatUSD(toUSD(amount))}</span>}
                 </div>
               </div>
             )

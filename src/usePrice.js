@@ -1,56 +1,98 @@
+/**
+ * h173k price — read directly from the on-chain h173k-USDT Raydium CPMM pool.
+ *
+ * Price (USD per h173k) = USDT reserve / h173k reserve, taken straight from the
+ * pool's vault balances. No third-party price API. USDT ≈ $1, so the pool ratio
+ * is the USD price.
+ */
+
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { PRICE_UPDATE_INTERVAL } from './constants'
+import { PublicKey } from '@solana/web3.js'
+import { PRICE_UPDATE_INTERVAL, TOKEN_MINT } from './constants'
 
-const POOL_ADDRESS = 'J9ED7D3pR7Uw5W6Y52p1Mq3Gfkmumg8fHRvLEiHLL2S7'
+// h173k-USDT Raydium CPMM pool
+const POOL_ID = new PublicKey('J9ED7D3pR7Uw5W6Y52p1Mq3Gfkmumg8fHRvLEiHLL2S7')
+// USDT (SPL) mint on Solana — used to confirm the pool's quote token.
+const USDT_MINT = new PublicKey('Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB')
 
-export function useTokenPrice() {
+// Raydium CPMM PoolState layout offsets (same layout used by the swap pool).
+const OFF = { token0Vault: 72, token1Vault: 104, token0Mint: 168, token1Mint: 200 }
+
+export function useTokenPrice(connection) {
   const [price, setPrice] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [lastUpdated, setLastUpdated] = useState(null)
   const intervalRef = useRef(null)
+  // Cache the pool's resolved vaults so we only parse the pool account once.
+  const poolRef = useRef(null) // { h173kVault: PublicKey, quoteVault: PublicKey }
+
+  const resolvePool = useCallback(async () => {
+    if (poolRef.current) return poolRef.current
+    const acc = await connection.getAccountInfo(POOL_ID)
+    if (!acc || !acc.data) throw new Error('Pool account not found')
+    const data = acc.data
+    const pk = (start) => new PublicKey(data.subarray(start, start + 32))
+
+    const token0Mint = pk(OFF.token0Mint)
+    const token1Mint = pk(OFF.token1Mint)
+    const token0Vault = pk(OFF.token0Vault)
+    const token1Vault = pk(OFF.token1Vault)
+
+    let h173kVault, quoteVault, quoteMint
+    if (token0Mint.equals(TOKEN_MINT)) {
+      h173kVault = token0Vault; quoteVault = token1Vault; quoteMint = token1Mint
+    } else if (token1Mint.equals(TOKEN_MINT)) {
+      h173kVault = token1Vault; quoteVault = token0Vault; quoteMint = token0Mint
+    } else {
+      // Layout/assumption is wrong — refuse to produce a (possibly bogus) price.
+      throw new Error('h173k mint not found in pool (unexpected pool layout)')
+    }
+    if (!quoteMint.equals(USDT_MINT)) {
+      throw new Error('Pool quote token is not USDT')
+    }
+    poolRef.current = { h173kVault, quoteVault }
+    return poolRef.current
+  }, [connection])
 
   const fetchPrice = useCallback(async () => {
+    if (!connection) return
     try {
-      const response = await fetch(
-        `https://api.geckoterminal.com/api/v2/networks/solana/pools/${POOL_ADDRESS}`,
-        { headers: { 'Accept': 'application/json' } }
-      )
+      const { h173kVault, quoteVault } = await resolvePool()
 
-      if (!response.ok) {
-        if (response.status === 429) {
-          console.warn('GeckoTerminal rate limited, will retry later')
-          return
-        }
-        throw new Error(`HTTP error! status: ${response.status}`)
-      }
+      const [h173kBal, usdtBal] = await Promise.all([
+        connection.getTokenAccountBalance(h173kVault),
+        connection.getTokenAccountBalance(quoteVault),
+      ])
 
-      const data = await response.json()
-      const tokenPrice = parseFloat(data?.data?.attributes?.base_token_price_usd)
+      const h173kReserve = Number(h173kBal?.value?.uiAmount)
+      const usdtReserve = Number(usdtBal?.value?.uiAmount)
 
-      if (tokenPrice && !isNaN(tokenPrice)) {
-        setPrice(tokenPrice)
+      if (h173kReserve > 0 && usdtReserve > 0 && isFinite(usdtReserve / h173kReserve)) {
+        setPrice(usdtReserve / h173kReserve)
         setLastUpdated(new Date())
         setError(null)
       } else {
-        setPrice(null)
+        // Keep the last good price; just flag the issue.
         setError('Price unavailable')
       }
     } catch (err) {
-      console.error('Error fetching price:', err)
+      console.error('Error reading pool price:', err)
+      // Keep the last good price on transient RPC errors.
       setError(err.message)
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [connection, resolvePool])
 
   useEffect(() => {
+    if (!connection) return
     fetchPrice()
     intervalRef.current = setInterval(fetchPrice, PRICE_UPDATE_INTERVAL)
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current)
     }
-  }, [fetchPrice])
+  }, [connection, fetchPrice])
 
   const toUSD = useCallback((tokenAmount) => {
     if (price === null || tokenAmount === null || tokenAmount === undefined) return null
@@ -58,14 +100,4 @@ export function useTokenPrice() {
   }, [price])
 
   return { price, loading, error, lastUpdated, toUSD, refetch: fetchPrice }
-}
-
-export function formatLastUpdated(date) {
-  if (!date) return ''
-  const now = new Date()
-  const diff = Math.floor((now - date) / 1000)
-  if (diff < 60) return 'just now'
-  if (diff < 120) return '1 min ago'
-  if (diff < 3600) return `${Math.floor(diff / 60)} min ago`
-  return date.toLocaleTimeString()
 }

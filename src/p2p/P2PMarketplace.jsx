@@ -324,12 +324,25 @@ function OfferCard({ offer, cur, price, isMine, onClick }) {
 // ===========================================================================
 function OfferDetail({ offer, cur, price, balance, isMine, posting, onClose, onCancel, showToast }) {
   const [revealed, setRevealed] = useState(false)
-  const required = requiredH173KToTake(offer, price)
-  const paysH173k = viewerPaysInH173K(offer)
+  const [amount, setAmount] = useState(() => String(offer.minUsd || ''))
+
+  // Per the offer type: a "buy" offer = you buy h173k; a "sell" offer = you sell h173k.
+  const viewerAction = offer.type === 'buy' ? 'buy' : 'sell'
+  const sendsH173k = viewerAction === 'sell'          // you send h173k when selling
+  const multiplier = sendsH173k ? 2 : 1               // MAD deposit: seller(send)=2×, buyer(receive)=1×
+  const minH173k = price > 0 ? offer.minUsd / price : null
+  const required = minH173k != null ? minH173k * multiplier : null   // h173k to back the MIN size (reveal gate)
   const enough = required != null && balance >= required
 
-  // example using the minimum size
-  const trade = computeTrade(offer, offer.minUsd, price)
+  // Calculator for the amount the user wants to trade (within the offer range).
+  const amt = parseFloat(amount)
+  const inRange = amt >= offer.minUsd && amt <= offer.maxUsd
+  const calc = (amt > 0 && price > 0) ? computeTrade(offer, amt, price) : null
+  // h173k you must hold to run the MAD contract for THIS amount (only when you send h173k).
+  const neededForAmount = (sendsH173k && calc?.h173kAmount != null) ? calc.h173kAmount * 2 : null
+  const enoughForAmount = neededForAmount == null ? null : balance >= neededForAmount
+
+  const setAmt = (e) => { const v = e.target.value; if (v === '' || (parseFloat(v) >= 0 && !v.includes('-'))) setAmount(v) }
 
   const tryReveal = () => {
     if (isMine) return
@@ -349,18 +362,61 @@ function OfferDetail({ offer, cur, price, balance, isMine, posting, onClose, onC
     <div className="p2p-modal-overlay" onClick={onClose}>
       <div className="p2p-modal" onClick={(e) => e.stopPropagation()}>
         <div className="p2p-modal-head">
-          <h3>{offer.type === 'buy' ? 'Buy' : 'Sell'} offer · {offer.nickname || 'anon'}</h3>
+          <h3>{viewerAction === 'buy' ? 'Buy' : 'Sell'} h173k · {offer.nickname || 'anon'}</h3>
           <button className="p2p-icon-btn" onClick={onClose}><Close /></button>
         </div>
 
         <div className="deposit-preview">
           <div className="deposit-row"><span>Price</span><span>{formatNumber(offer.pricePerUsd, 4)} {cur?.code} / $1 h173k</span></div>
           <div className="deposit-row"><span>Size range</span><span>${formatNumber(offer.minUsd, 2)} – ${formatNumber(offer.maxUsd, 2)}</span></div>
-          <div className="deposit-row"><span>At min size you {paysH173k ? 'sell' : 'buy'}</span>
-            <span>{trade.h173kAmount != null ? `${formatH173K(trade.h173kAmount)} h173k` : '—'} (${formatNumber(offer.minUsd, 2)})</span></div>
-          <div className="deposit-row"><span>You {paysH173k ? 'receive' : 'pay'}</span>
-            <span>{formatNumber(trade.fiatAmount, 2)} {cur?.code}</span></div>
         </div>
+
+        {/* ---- Trade calculator ---- */}
+        <div className="form-group" style={{ marginTop: 4 }}>
+          <label className="form-label">
+            {viewerAction === 'buy' ? 'How much do you want to buy? ($ value)' : 'How much do you want to sell? ($ value)'}
+          </label>
+          <input className="form-input" type="number" inputMode="decimal" min="0" step="any" value={amount}
+            style={amt > 0 && !inRange ? { borderColor: 'var(--color-error)' } : undefined}
+            onKeyDown={(e) => { if (['-', 'e', 'E', '+'].includes(e.key)) e.preventDefault() }}
+            onChange={setAmt} placeholder={`${formatNumber(offer.minUsd, 2)} – ${formatNumber(offer.maxUsd, 2)}`} />
+          {amt > 0 && !inRange && <span className="form-hint" style={{ color: 'var(--color-error)' }}>Outside the offer range (${formatNumber(offer.minUsd, 2)}–${formatNumber(offer.maxUsd, 2)}).</span>}
+        </div>
+
+        {calc && (
+          <div className="deposit-preview">
+            {viewerAction === 'buy' ? (
+              <>
+                <div className="deposit-row"><span>You receive</span><span><strong>≈ {formatH173K(calc.h173kAmount)} h173k</strong></span></div>
+                <div className="deposit-row"><span>You pay</span><span>{formatNumber(calc.fiatAmount, 2)} {cur?.code}</span></div>
+              </>
+            ) : (
+              <>
+                <div className="deposit-row"><span>You receive</span><span><strong>{formatNumber(calc.fiatAmount, 2)} {cur?.code}</strong></span></div>
+                <div className="deposit-row"><span>You send</span><span>≈ {formatH173K(calc.h173kAmount)} h173k</span></div>
+                <div className="deposit-row"><span>h173k needed (MAD)</span>
+                  <span style={{ color: enoughForAmount === false ? 'var(--color-error)' : undefined }}>
+                    ≈ {neededForAmount != null ? formatH173K(neededForAmount) : '—'} h173k
+                  </span></div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ---- Role note ---- */}
+        <div className="escrow-info-card">
+          {viewerAction === 'sell' ? (
+            <p>You (the <strong>seller</strong>) <strong>create</strong> the MAD contract — there you're called the <em>buyer</em>, because in MAD h173k is the currency. You send h173k and lock 2× the size as deposit.</p>
+          ) : (
+            <p>You (the <strong>buyer</strong>) <strong>accept</strong> the MAD contract — there you're called the <em>seller</em>, because in MAD h173k is the currency. You receive h173k and lock 1× the size as deposit.</p>
+          )}
+        </div>
+
+        {viewerAction === 'sell' && neededForAmount != null && enoughForAmount === false && (
+          <div className="escrow-info-card" style={{ borderColor: 'var(--color-error)' }}>
+            <p style={{ color: 'var(--color-error)' }}>⚠ You need ≈ {formatH173K(neededForAmount)} h173k for this amount but have {formatH173K(balance)} h173k.</p>
+          </div>
+        )}
 
         {offer.paymentMethods?.length > 0 && (
           <div className="form-group">
@@ -389,9 +445,9 @@ function OfferDetail({ offer, cur, price, balance, isMine, posting, onClose, onC
         ) : (
           <>
             <div className="escrow-info-card">
-              <p>To take this offer you must be able to open a MAD contract:
+              <p>To take this offer you must be able to open the MAD contract at the min size:
                 you need <strong>≈ {required != null ? formatH173K(required) : '—'} h173k</strong>
-                {' '}({paysH173k ? '2× the min size, since you pay in h173k' : '1× the min size'}).
+                {' '}({sendsH173k ? '2× the min size, since you send h173k' : '1× the min size'}).
                 Your balance: {formatH173K(balance)} h173k.</p>
             </div>
             <button className="btn btn-action" disabled={!enough} onClick={tryReveal}>
@@ -479,7 +535,7 @@ function CreateOffer({ cur, defaultType, posting, solBalance, balance, price, on
           <label className="form-label">Price — {cur?.code} per $1 of h173k value</label>
           <input className="form-input" type="number" inputMode="decimal" min="0" step="any" value={pricePerUsd}
             style={errStyle(priceErr)}
-            onKeyDown={blockMinus} onChange={setNum(setPrice)} placeholder={`Amount in ${cur?.code}`} />
+            onKeyDown={blockMinus} onChange={setNum(setPrice)} placeholder={`Price in ${cur?.code}`} />
           {type === 'sell' ? (
             // creator sends h173k and receives fiat → show fiat received
             <span className="form-hint">

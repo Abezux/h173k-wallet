@@ -1828,6 +1828,13 @@ body {
   font-weight: var(--font-medium);
 }
 
+.contract-item-usd {
+  font-size: 13px;
+  font-weight: var(--font-regular);
+  color: var(--color-white-50);
+  margin-left: 8px;
+}
+
 /* === Deposit Preview === */
 .deposit-preview {
   background: var(--color-white-05);
